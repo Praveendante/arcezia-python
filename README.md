@@ -233,7 +233,7 @@ unresolved and the action stays in `REVIEW`.
 > `User-Agent`, and the verify response field on the wire is `dc_score` — the
 > SDK exposes it as `cert.precondition_score`.
 
-Full guide: [arcezia.com/docs](https://arcezia.com/docs)
+Full guide: [arcezia.com/docs](https://arcezia.com/developer-docs)
 
 ## Development mode
 
@@ -251,6 +251,5 @@ point at `localhost`.
 
 ## Links
 
-- [Documentation](https://arcezia.com/docs)
-- [API reference](https://arcezia.com/docs/api)
+- [Developer documentation](https://arcezia.com/developer-docs)
 - [Dashboard](https://app.arcezia.com)

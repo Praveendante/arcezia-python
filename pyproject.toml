@@ -56,7 +56,7 @@ arcezia-hook = "arcezia.integrations.claude_code:main"
 
 [project.urls]
 Homepage      = "https://arcezia.com"
-Documentation = "https://arcezia.com/docs"
+Documentation = "https://arcezia.com/developer-docs"
 Repository    = "https://github.com/Praveendante/arcezia-python"
 "Bug Tracker" = "https://github.com/Praveendante/arcezia-python/issues"
 
