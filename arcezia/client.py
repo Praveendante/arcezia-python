@@ -79,6 +79,18 @@ class ArceziaAPIError(RuntimeError):
         super().__init__(f"Arcezia API error {status_code}: {body}")
 
 
+class ArceziaAuthError(ArceziaAPIError):
+    """Raised on HTTP 401 — the API key is missing, invalid, or revoked.
+
+    Distinct from the generic API error so callers can catch an auth failure
+    specifically ("go get / rotate a key") rather than by string-matching a
+    bare RuntimeError. Subclasses ArceziaAPIError, so existing
+    `except ArceziaAPIError` handlers still catch it.
+    """
+    def __init__(self, body: str):
+        super().__init__(401, body)
+
+
 class ArceziaRateLimitError(RuntimeError):
     """Raised on HTTP 429. `retry_after` is the server's suggested wait (seconds)."""
     def __init__(self, detail: dict, retry_after: Optional[int] = None):
@@ -281,7 +293,7 @@ def _raise_for_status(status: int, body: dict) -> None:
         retry_after = detail.get("window") and 60  # per-minute window → 60s
         raise ArceziaRateLimitError(detail, retry_after=retry_after)
     if status == 401:
-        raise RuntimeError(f"Invalid API key: {body.get('detail', body)}")
+        raise ArceziaAuthError(str(body.get("detail", body)))
     if status >= 400:
         raise ArceziaAPIError(status, str(body))
 

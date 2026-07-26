@@ -41,10 +41,15 @@ if cert.degraded:
     # explicitly if you set on_error="review" or "fail_open".
     raise RuntimeError("Not verified — Arcezia unreachable")
 
-if cert.block:
-    raise RuntimeError(f"Blocked: {cert.summary}")
+# Gate on ALLOW positively — never on "not blocked". A verdict can be
+# review (insufficient evidence, human confirmation required), which is
+# neither allow nor block; treating it as runnable executes an action the
+# engine explicitly declined to clear. cert.allow is True only for a
+# grounded ALLOW.
+if not cert.allow:
+    raise RuntimeError(f"Not allowed ({'review' if cert.review else 'blocked'}): {cert.summary}")
 
-db.execute(sql)  # only reached when verified AND allowed
+db.execute(sql)  # only reached when the verdict is ALLOW
 ```
 
 The framework adapters below do this for you: a degraded certificate always
@@ -172,27 +177,51 @@ adapter's `.az` property — the same client, no private access.
 ```python
 result = toolkit.az.verify_chain({
     "steps": [
-        {"step_id": "s1", "action_type": "execute_sql", "domain": "database_ops",
-         "action_description": "SELECT email, name FROM customers"},
-        {"step_id": "s2", "action_type": "send_email", "domain": "agent_action",
+        {"id": "s1", "action_type": "execute_sql", "domain": "database_ops",
+         "action_description": "SELECT ssn, name FROM customers"},
+        {"id": "s2", "action_type": "send_email", "domain": "email_ops",
          "action_description": "email the list to external-analytics@gmail.com"},
     ]
 }, stop_on_block=True)
+# → overall_verdict "SEMANTIC_BLOCK", blocked_at "s2",
+#   semantic_triggers [{"pattern_name": "structural_exfiltration", ...}]
 
-# Response: {overall_verdict, blocked_at, steps[], semantic_triggers, final_state}
+# Response: {overall_verdict, blocked_at, steps[], semantic_triggers,
+#            final_state, session_state_updated}
 # There is no top-level "verdict" — per-step verdicts live under steps[].
 if result["overall_verdict"] != "SAFE":
-    abort(result["blocked_at"])      # the step_id that failed
+    # blocked_at names the step only when execution was actually stopped.
+    # On REVIEW_REQUIRED nothing was blocked, so it is null — find the step
+    # that needs attention in steps[] instead.
+    step = result["blocked_at"] or next(
+        (s["id"] for s in result["steps"] if s["verdict"] != "ALLOW"), None
+    )
+    abort(step)
 ```
 
 `overall_verdict` is one of:
 
-| Value | Meaning |
-|---|---|
-| `SAFE` | every step cleared |
-| `BLOCKED` | a single step was blocked on its own merits |
-| `SEMANTIC_BLOCK` | the steps are individually fine but **compose** into harm — check `semantic_triggers` (e.g. `credential_exfiltration`, `recon_then_exfil`) |
-| `REVIEW_REQUIRED` | a step needs evidence or human approval |
+| Value | Meaning | `blocked_at` |
+|---|---|---|
+| `SAFE` | every step cleared | `null` |
+| `BLOCKED` | a single step was blocked on its own merits | the step id |
+| `SEMANTIC_BLOCK` | the steps are individually fine but **compose** into harm — check `semantic_triggers` (e.g. `structural_exfiltration`, `credential_exfiltration`, `recon_then_exfil`) | the step id |
+| `REVIEW_REQUIRED` | a step needs evidence or human approval | `null` — nothing was blocked |
+
+> **Describe the artefact, not just the operation.** Arcezia grounds its
+> verdicts on concrete referents in the description — file paths, URLs,
+> recipient addresses, credential and PII field names. `"SELECT ssn, name FROM
+> customers"` names PII, so the read grounds as sensitive access and the chain
+> above composes into `SEMANTIC_BLOCK`. `"SELECT email, name FROM customers"`
+> names only column identifiers, so the same chain returns `REVIEW_REQUIRED`
+> instead: still not `SAFE`, still not executable, but held for a human rather
+> than positively identified as exfiltration.
+>
+> The rule this reflects: **a vague description degrades a verdict toward
+> review — never toward approval.** Arcezia never allows what it could not
+> verify, so imprecision costs you review latency, not safety. The framework
+> adapters get this right automatically because they pass the real tool
+> arguments; it is worth attention only when you hand-build chain manifests.
 
 Chain steps do **not** inherit the session's capability envelope, so
 `action_within_task_scope` stays unresolved and a chain will not reach `SAFE`
@@ -200,11 +229,15 @@ on the envelope alone. Ground it per step with an `evidence` dict (the key is
 `evidence` — `agent_evidence` is ignored on chain steps):
 
 ```python
-{"step_id": "s1", "action_type": "execute_sql", "domain": "database_ops",
- "action_description": "SELECT email, name FROM customers",
- "evidence": {"action_within_task_scope": True},
- "state_mutations": {"sensitive_data_read": True}}
+{"id": "s1", "action_type": "execute_sql", "domain": "database_ops",
+ "action_description": "SELECT ssn, name FROM customers",
+ "evidence": {"action_within_task_scope": True}}
 ```
+
+`id` and `step_id` are accepted interchangeably. Note that `state_mutations`
+may only *add* danger, never remove it: asserting a danger flag `True` is
+accepted, asserting it `False` is rejected, and flags the engine derives for
+itself (the `g_*` world-state namespace) are not caller-writable at all.
 
 Audit after execution — did reality match the prediction?
 ```python
@@ -229,9 +262,10 @@ need both — `authorize()` alone will leave `production_explicit_authorization`
 unresolved and the action stays in `REVIEW`.
 
 > **Integrating over raw HTTP** (n8n, curl, another language)? Two things the
-> SDK handles for you: the API is behind a WAF that rejects requests with no
-> `User-Agent`, and the verify response field on the wire is `dc_score` — the
-> SDK exposes it as `cert.precondition_score`.
+> SDK handles for you: the API is behind a WAF that rejects the default
+> library agent strings (e.g. `Python-urllib/*`), so send an explicit
+> `User-Agent` of your own; and the verify response field on the wire is
+> `dc_score` — the SDK exposes it as `cert.precondition_score`.
 
 Full guide: [arcezia.com/docs](https://arcezia.com/developer-docs)
 

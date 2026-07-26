@@ -749,6 +749,7 @@ class TestConvenienceConstructors(unittest.TestCase):
     def _az_of(self, obj):
         return getattr(obj, "_az", None) or getattr(obj, "az", None)
 
+    @unittest.skipUnless(_LANGCHAIN_AVAILABLE, "langchain not installed")
     def test_langchain_toolkit_inline_credentials(self):
         from arcezia.integrations.langchain import ArceziaToolkit
         tk = ArceziaToolkit(api_key=self._K, task="t", api_url=self._U)
@@ -769,6 +770,7 @@ class TestConvenienceConstructors(unittest.TestCase):
         g = ArceziaAutoGenGuard(api_key=self._K, task="t", api_url=self._U)
         self.assertIsNotNone(self._az_of(g))
 
+    @unittest.skipUnless(_LANGCHAIN_AVAILABLE, "langchain not installed")
     def test_positional_az_still_supported(self):
         from arcezia.integrations.openai import ArceziaGuard
         from arcezia.integrations.langchain import ArceziaToolkit
