@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arcezia"
+version = "1.0.0"
+description = "Runtime safety enforcement for autonomous AI agents — official Python SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Praveen Dante", email = "praveen@aairi.in" }
+]
+keywords = [
+    "ai-safety", "agents", "langchain", "openai", "anthropic",
+    "llm", "guardrails", "runtime-safety", "ai-agents", "safety-verification"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+    "Development Status :: 4 - Beta",
+]
+# httpx is optional — falls back to urllib.request (stdlib)
+dependencies = []
+
+# Framework extras declare the *minimum supported version* of each integration.
+# Adapters are tested against these minimums and the latest release (see the CI
+# version matrix in noxfile.py / .github/workflows/integrations.yml).
+[project.optional-dependencies]
+httpx     = ["httpx>=0.27"]
+langchain = ["langchain>=0.2", "langchain-core>=0.2", "httpx>=0.27"]
+langgraph = ["langgraph>=0.2", "langchain-core>=0.2", "httpx>=0.27"]
+openai    = ["openai>=1.30", "httpx>=0.27"]
+anthropic = ["anthropic>=0.28", "httpx>=0.27"]
+crewai    = ["crewai>=0.30", "httpx>=0.27"]
+llamaindex = ["llama-index-core>=0.11", "httpx>=0.27"]
+# AutoGen adapter is version-agnostic (wraps callables); this pulls the modern
+# line. Legacy AutoGen 0.2 (`pyautogen>=0.2`) is also supported.
+autogen   = ["autogen-agentchat>=0.4", "httpx>=0.27"]
+# The universal guard (arcezia.guard / guard_callable) needs no extra — it wraps
+# plain callables and covers Pydantic AI, smolagents, OpenAI Agents SDK,
+# Google ADK, Strands and any framework with function tools.
+all = [
+    "httpx>=0.27", "langchain>=0.2", "langchain-core>=0.2", "langgraph>=0.2",
+    "openai>=1.30", "anthropic>=0.28", "crewai>=0.30", "llama-index-core>=0.11",
+    "autogen-agentchat>=0.4",
+]
+
+[project.scripts]
+# `arcezia-hook install` wires the Claude Code PreToolUse hook; with no args it
+# acts as the hook (reads the tool call on stdin, emits the permission decision).
+arcezia-hook = "arcezia.integrations.claude_code:main"
+
+[project.urls]
+Homepage      = "https://arcezia.com"
+Documentation = "https://arcezia.com/docs"
+Repository    = "https://github.com/Praveendante/arcezia-python"
+"Bug Tracker" = "https://github.com/Praveendante/arcezia-python/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["arcezia*"]
