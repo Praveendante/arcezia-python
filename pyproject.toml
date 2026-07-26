@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Praveen Dante", email = "praveen@aairi.in" }
+    { name = "Praveen Dante", email = "praveen@arcezia.com" }
 ]
 keywords = [
     "ai-safety", "agents", "langchain", "openai", "anthropic",
