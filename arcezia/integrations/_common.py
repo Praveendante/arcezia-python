@@ -23,9 +23,10 @@ def coerce_az(
     the keyword arguments.
 
     If ``capability_envelope`` is provided and a NEW client is created, the
-    session is started with the envelope (injects authority_allows_* flags
-    into the session at creation). If ``az`` is an existing client, the caller is responsible
-    for having called ``az.start_session(capability_envelope=...)`` already.
+    session is opened with that envelope, so the authority it declares applies
+    to every verification in the session. If ``az`` is an existing client, the
+    caller is responsible for having called
+    ``az.start_session(capability_envelope=...)`` already.
     """
     if az is not None:
         return az

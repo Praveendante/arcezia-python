@@ -41,7 +41,8 @@ Custom evidence provider:
         return {"file_is_in_sandbox": args.get("path","").startswith("/tmp/"))
 
     guard = DispatchGuard(..., evidence_provider=my_probe)
-    # Note: evidence from `evidence_provider` is CLAIMED (LLM-inferred quality).
+    # Note: evidence from `evidence_provider` is CLAIMED — the agent side
+    # asserted it, so it is recorded but never treated as authoritative.
     # For GROUNDED evidence register a webhook probe via POST /v1/probes.
 
 Active-permission ledger:
