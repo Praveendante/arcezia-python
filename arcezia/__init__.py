@@ -109,7 +109,7 @@ from arcezia.client import (  # noqa: F401
 )
 from arcezia.integrations.universal import guard, guard_callable  # noqa: F401
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __all__ = [
     "Arcezia", "ArceziaCertificate", "ArceziaBlockError", "ArceziaReviewError",
     "ArceziaUpgradeRequired", "ArceziaRateLimitError", "ArceziaUnavailableError",

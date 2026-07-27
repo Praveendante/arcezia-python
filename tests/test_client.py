@@ -602,5 +602,56 @@ class TestAuthorize(unittest.TestCase):
         self.assertEqual(az._prod_token, "prod-jwt")
 
 
+# ── structural_authority validation ──────────────────────────────────────────
+
+class TestStructuralAuthorityValidation(unittest.TestCase):
+    """A typo'd axis grants nothing server-side, so it must fail HERE — loudly,
+    locally, before any request — instead of surfacing later as an unexplained
+    REVIEW. The README documents this rejection; this pins it."""
+
+    @patch("arcezia.client._post")
+    def test_unknown_axis_raises_before_any_request(self, mock_post):
+        az = Arcezia(api_key="ar_test_xxx", task="read analytics")
+        with self.assertRaises(ValueError) as ctx:
+            az.start_session(capability_envelope={
+                "structural_authority": {
+                    "sensitive_data": True,
+                    "mutation": True,          # typo: persistent_mutation
+                },
+            })
+        # Actionable error: names the offender and the valid set.
+        self.assertIn("mutation", str(ctx.exception))
+        self.assertIn("persistent_mutation", str(ctx.exception))
+        mock_post.assert_not_called()
+
+    @patch("arcezia.client._post")
+    def test_all_six_exact_axes_accepted(self, mock_post):
+        mock_post.side_effect = _make_post_side_effect(_allow_resp())
+        az = Arcezia(api_key="ar_test_xxx", task="read analytics")
+        az.start_session(capability_envelope={
+            "max_scope": "batch",
+            "structural_authority": {
+                "sensitive_data": True,
+                "outbound": False,
+                "persistent_mutation": False,
+                "mass_scope": False,
+                "trust_boundary_crossing": False,
+                "irreversible": False,
+            },
+        })
+        self.assertEqual(mock_post.call_count, 1)
+
+    @patch("arcezia.client._post")
+    def test_envelope_without_structural_authority_unaffected(self, mock_post):
+        """Validation only inspects structural_authority — the plain envelope
+        path (allowed_domains / max_scope only) is untouched."""
+        mock_post.side_effect = _make_post_side_effect(_allow_resp())
+        az = Arcezia(api_key="ar_test_xxx", task="read analytics")
+        az.start_session(capability_envelope={
+            "allowed_domains": ["database_ops"], "max_scope": "batch",
+        })
+        self.assertEqual(mock_post.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

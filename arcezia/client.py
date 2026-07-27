@@ -407,6 +407,22 @@ class Arcezia:
     # Session lifecycle
     # ------------------------------------------------------------------
 
+    # The complete set of structural_authority axes — closed by design. This
+    # SDK version documents exactly these six; validation below makes a typo
+    # fail HERE, loudly and locally, instead of surfacing days later as an
+    # unexplained REVIEW from a different endpoint. (The server deliberately
+    # does NOT hard-reject unknown axes — an unknown key grants nothing, and a
+    # raw-HTTP caller on a newer API version must not break — it reports them
+    # in the session response as `ignored_authority_keys`.)
+    STRUCTURAL_AUTHORITY_AXES = frozenset({
+        "sensitive_data",
+        "outbound",
+        "persistent_mutation",       # NOT "mutation"
+        "mass_scope",
+        "trust_boundary_crossing",   # NOT "trust_crossing"
+        "irreversible",
+    })
+
     def start_session(
         self,
         capability_envelope: Optional[dict] = None,
@@ -421,12 +437,38 @@ class Arcezia:
             capability_envelope: Optional human-signed scope authorization dict.
                 When provided, grounds action_within_task_scope for all verify()
                 calls in this session. Fields: allowed_domains (list[str]),
-                max_scope ("single_record"|"batch"|"mass"), allowed_action_types
-                (list[str]), expires_at (ISO-8601 str). In production, this dict
-                should be signed by your backend after the user confirms scope.
+                allowed_action_types (list[str]),
+                max_scope ("single_record"|"batch"|"limited"|"mass"),
+                expires_at (ISO-8601 str), and structural_authority (dict) —
+                the six yes/no axes an action may cross, which is what unlocks
+                ALLOW: sensitive_data, outbound, persistent_mutation,
+                mass_scope, trust_boundary_crossing, irreversible. The envelope
+                is a ceiling, not a permission slip: an axis set True only
+                removes that axis as a blocker; every other check still
+                applies. In production, this dict should be signed by your
+                backend after the user confirms scope.
+
+        Raises:
+            ValueError: if structural_authority contains an unrecognised axis
+                name. An unknown axis grants nothing server-side, so a typo
+                ("mutation", "trust_crossing") would silently leave that axis
+                unresolved — rejected here instead, where it is actionable.
         """
         payload: dict = {"task": self._task}
         if capability_envelope:
+            sa = capability_envelope.get("structural_authority")
+            if isinstance(sa, dict):
+                unknown = sorted(set(sa) - self.STRUCTURAL_AUTHORITY_AXES)
+                if unknown:
+                    raise ValueError(
+                        f"Unrecognised structural_authority ax"
+                        f"{'is' if len(unknown) == 1 else 'es'} {unknown}: an "
+                        f"unknown axis grants nothing and would leave it "
+                        f"unresolved (REVIEW). Valid axes: "
+                        f"{sorted(self.STRUCTURAL_AUTHORITY_AXES)}. Note it is "
+                        f"'persistent_mutation' (not 'mutation') and "
+                        f"'trust_boundary_crossing' (not 'trust_crossing')."
+                    )
             payload["capability_envelope"] = capability_envelope
         status, body = _post(
             f"{self._api_url}/v1/session",

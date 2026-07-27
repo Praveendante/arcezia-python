@@ -160,6 +160,58 @@ Two scores travel with every certificate — they measure different things:
 | `cert.precondition_score` | `[0,1]` severity-weighted fraction of required preconditions **satisfied** |
 | `cert.trust_score` | `[0,1]` fraction of evidence that is **externally grounded**, not agent-claimed |
 
+## Declaring authority — how an action reaches `ALLOW`
+
+Arcezia never infers what you permit; a principal declares it. Without that
+declaration the scope of an action is unresolved, and an unresolved action is
+never allowed — so a fresh session returns `REVIEW` even for a harmless read.
+That is the design, not a misconfiguration: **Arcezia does not allow what it
+cannot positively verify.**
+
+Declare authority once, when the session opens:
+
+```python
+az = arcezia.Arcezia(task="read analytics for the weekly report")
+az.start_session(capability_envelope={
+    "max_scope": "batch",              # single_record | batch | limited | mass
+    "structural_authority": {
+        "sensitive_data":          True,   # may touch credentials/PII
+        "outbound":                False,  # may send data out
+        "persistent_mutation":     False,  # may change stored state
+        "mass_scope":              False,  # may act on many records at once
+        "trust_boundary_crossing": False,  # may call external principals
+        "irreversible":            False,  # may take unrecoverable actions
+    },
+})
+
+cert = az.verify(action_type="execute_sql",
+                 action_description="SELECT COUNT(*) FROM events",
+                 domain="database_ops")
+# → ALLOW, with a signed credential
+```
+
+Those six axes are the complete set, and the names are exact. The SDK rejects
+an unrecognised axis at `start_session` with a `ValueError` (v1.0.1+), because
+a silently dropped axis would leave you believing you had granted or denied
+something you had not. Over raw HTTP the server accepts the session but grants
+nothing for the unknown axis and reports it back as `ignored_authority_keys`
+in the response — never a silent grant either way. Two are easy to get wrong:
+it is `persistent_mutation` (not `mutation`) and `trust_boundary_crossing`
+(not `trust_crossing`).
+
+The envelope is a *ceiling*, not a permission slip. Declaring
+`outbound: False` and then attempting an outbound action does not produce
+`ALLOW` — the action contradicts the authority you signed, so it is **blocked**,
+and no runtime approval token can lift it. Widening authority is your act: sign
+a new envelope. Declaring an axis `True` does not force `ALLOW` either; it only
+removes that axis as a blocker, and every other check still applies.
+
+**Declare all six axes.** An axis you *omit* is not a ceiling — it is an open
+question, and a signed human token (`az.authorize(...)`) can answer it for the
+session. That is the intended escalation path for work nobody pre-authorized,
+but it means one `authorize()` call covers every axis you left unspecified. Only
+an axis you declared `False` is a hard limit.
+
 ## The four levels
 
 Each level is useful on its own and assumes the one below it. Every framework
@@ -264,8 +316,9 @@ unresolved and the action stays in `REVIEW`.
 > **Integrating over raw HTTP** (n8n, curl, another language)? Two things the
 > SDK handles for you: the API is behind a WAF that rejects the default
 > library agent strings (e.g. `Python-urllib/*`), so send an explicit
-> `User-Agent` of your own; and the verify response field on the wire is
-> `dc_score` — the SDK exposes it as `cert.precondition_score`.
+> `User-Agent` of your own; and the precondition score is on the wire as
+> `precondition_score` (with `dc_score` kept as a legacy alias for older
+> consumers) — the SDK exposes it as `cert.precondition_score`.
 
 Full guide: [arcezia.com/docs](https://arcezia.com/developer-docs)
 
