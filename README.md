@@ -160,6 +160,20 @@ Two scores travel with every certificate — they measure different things:
 | `cert.precondition_score` | `[0,1]` severity-weighted fraction of required preconditions **satisfied** |
 | `cert.trust_score` | `[0,1]` fraction of evidence that is **externally grounded**, not agent-claimed |
 
+When a verdict is not `ALLOW`, two more fields tell you why — and they answer
+different questions:
+
+| Field | Meaning |
+|---|---|
+| `cert.missing` | facts **you can act on**. Ground these and re-verify. Legitimately empty when nothing is caller-groundable. |
+| `cert.unresolved` | **every** ungrounded fact, including ones held by a rule rather than directly required. Read this when `missing` is empty but the verdict still is not `ALLOW`. |
+| `cert.denied_authority_axes` | axes you declared `False` in the capability envelope. An action that crosses one **cannot** reach `ALLOW`, and no token lifts it — widening means signing a new envelope. |
+
+That last one is the most common reason a correctly-wired integration stays
+stuck: declaring `"irreversible": False` and then verifying a `DELETE` denies the
+very axis the action needs. If every fact is grounded and the verdict still is
+not `ALLOW`, read `cert.denied_authority_axes` first.
+
 ## Declaring authority — how an action reaches `ALLOW`
 
 Arcezia never infers what you permit; a principal declares it. Without that

@@ -179,6 +179,18 @@ class ArceziaCertificate:
     signature: str
     credential: Optional[dict] = None     # set on ALLOW — pass to your tool
 
+    # Axes the principal declared False in the capability envelope. An action
+    # that crosses one cannot reach ALLOW, and no token lifts it — widening is a
+    # new signed envelope. Present on every verdict; empty when nothing was
+    # denied. This is the principal's own declaration echoed back, not an
+    # explanation of which rule acted on it.
+    denied_authority_axes: list[str] = field(default_factory=list)
+
+    # Every constraint still ungrounded, including those held by a rule rather
+    # than directly required. `missing` lists only what the caller can act on, so
+    # it can legitimately be empty while this is not.
+    unresolved: list[str] = field(default_factory=list)
+
     @property
     def degraded(self) -> bool:
         """True if this certificate is a synthetic fallback (unverified).
@@ -753,6 +765,8 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
         missing=resp.get("missing", []),
         fabrication_detected=resp.get("fabrication_detected", False),
         fabricated_constraints=resp.get("fabricated_constraints", []),
+        denied_authority_axes=resp.get("denied_authority_axes", []),
+        unresolved=resp.get("unresolved", []),
         constraints=[
             ArceziaConstraintDetail(
                 name=c["name"],
