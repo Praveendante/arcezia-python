@@ -168,11 +168,31 @@ different questions:
 | `cert.missing` | facts **you can act on**. Ground these and re-verify. Legitimately empty when nothing is caller-groundable. |
 | `cert.unresolved` | **every** ungrounded fact, including ones held by a rule rather than directly required. Read this when `missing` is empty but the verdict still is not `ALLOW`. |
 | `cert.denied_authority_axes` | axes you declared `False` in the capability envelope. An action that crosses one **cannot** reach `ALLOW`, and no token lifts it — widening means signing a new envelope. |
+| `cert.semantic_block` | a **cross-step** danger pattern fired for this session — e.g. a sensitive read earlier and an outbound send now. `cert.chain_patterns` names which. |
 
-That last one is the most common reason a correctly-wired integration stays
-stuck: declaring `"irreversible": False` and then verifying a `DELETE` denies the
-very axis the action needs. If every fact is grounded and the verdict still is
-not `ALLOW`, read `cert.denied_authority_axes` first.
+`denied_authority_axes` is the most common reason a correctly-wired integration
+stays stuck: declaring `"irreversible": False` and then verifying a `DELETE`
+denies the very axis the action needs. If every fact is grounded and the verdict
+still is not `ALLOW`, read it first.
+
+### A dangerous *sequence* can have a safe-looking step
+
+`cert.verdict` describes **this action**. A sequence can be dangerous while every
+step in it is unobjectionable alone — read customer records, then send data to an
+external host. When that happens the verdict stays `ALLOW` and
+`cert.semantic_block` is `True`.
+
+**`cert.allow` accounts for this**, so the gate below is correct as written and
+you do not need a second check:
+
+```python
+if not cert.allow:              # False on a cross-step block, even when verdict == "ALLOW"
+    raise RuntimeError(cert.summary)
+run_tool(...)
+```
+
+If you gate on `cert.verdict == "ALLOW"` instead, you will miss it. Gate on
+`cert.allow`.
 
 ## Declaring authority — how an action reaches `ALLOW`
 

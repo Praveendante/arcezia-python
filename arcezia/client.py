@@ -191,6 +191,15 @@ class ArceziaCertificate:
     # it can legitimately be empty while this is not.
     unresolved: list[str] = field(default_factory=list)
 
+    # Cross-step danger detected across this session, e.g. a sensitive read
+    # earlier and an outbound send now. "SEMANTIC_BLOCK" when a pattern fired.
+    # The per-action verdict can still be ALLOW — this action is fine in
+    # isolation; the SEQUENCE is not — so `allow` accounts for it below.
+    chain_status: Optional[str] = None
+
+    # Which cross-step patterns fired, e.g. ["structural_exfiltration"].
+    chain_patterns: list[str] = field(default_factory=list)
+
     @property
     def degraded(self) -> bool:
         """True if this certificate is a synthetic fallback (unverified).
@@ -200,20 +209,46 @@ class ArceziaCertificate:
         return self.credential is None and self.trust_score == 0.0
 
     @property
+    def semantic_block(self) -> bool:
+        """A cross-step danger pattern fired for this session.
+
+        The per-action verdict may still be ALLOW: this action is unobjectionable
+        on its own, and the SEQUENCE is what is dangerous — a sensitive read
+        earlier plus an outbound send now. The server withholds the credential
+        when this happens; `allow` is False for the same reason.
+        """
+        return self.chain_status == "SEMANTIC_BLOCK"
+
+    @property
     def allow(self) -> bool:
-        return self.verdict == "ALLOW" and not self.fabrication_detected
+        # A cross-step block is a refusal even when the step's own verdict is
+        # ALLOW. Before this was accounted for, `if not cert.allow: raise` — the
+        # gate this SDK's own documentation tells you to write — let a detected
+        # exfiltration through, because the detection lives in chain_status and
+        # nothing read it.
+        return (
+            self.verdict == "ALLOW"
+            and not self.fabrication_detected
+            and not self.semantic_block
+        )
 
     @property
     def block(self) -> bool:
-        return self.verdict == "BLOCK" or self.fabrication_detected
+        return self.verdict == "BLOCK" or self.fabrication_detected or self.semantic_block
 
     @property
     def review(self) -> bool:
-        return self.verdict == "REVIEW" and not self.fabrication_detected
+        return (
+            self.verdict == "REVIEW"
+            and not self.fabrication_detected
+            and not self.semantic_block
+        )
 
     def __str__(self) -> str:
         icon = {"ALLOW": "✅", "BLOCK": "❌", "REVIEW": "⚠️"}.get(self.verdict, "?")
         fab = " 🚨 FABRICATION DETECTED" if self.fabrication_detected else ""
+        if self.semantic_block:
+            fab += " ⛓️ CROSS-STEP BLOCK: " + ", ".join(self.chain_patterns or ["pattern"])
         return (
             f"{icon} {self.verdict}{fab} | "
             f"trust={self.trust_score:.0%} | "
@@ -767,6 +802,11 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
         fabricated_constraints=resp.get("fabricated_constraints", []),
         denied_authority_axes=resp.get("denied_authority_axes", []),
         unresolved=resp.get("unresolved", []),
+        chain_status=resp.get("chain_status"),
+        chain_patterns=[
+            p.get("pattern_name", str(p)) if isinstance(p, dict) else str(p)
+            for p in (resp.get("chain_patterns") or [])
+        ],
         constraints=[
             ArceziaConstraintDetail(
                 name=c["name"],
