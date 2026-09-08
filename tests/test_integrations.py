@@ -284,6 +284,26 @@ class TestLangChainToolkit(unittest.TestCase):
             wrapped.run("DROP TABLE users")
         tool.run.assert_not_called()
 
+    def test_gate_forwards_typed_params_for_dict_input(self):
+        """Classic ArceziaTool path forwards typed args (P2 addressing) —
+        it used to stringify dict input and drop the typed view entirely."""
+        from arcezia.integrations.langchain import ArceziaTool
+        tool = self._make_tool("update_record")
+        az = _fake_az(_allow())
+        wrapped = ArceziaTool(tool, az, domain="agent_action")
+        wrapped.run({"record_id": "r-42", "amount": 50000})
+        kwargs = az.verify.call_args.kwargs
+        self.assertEqual(kwargs.get("action_parameters"),
+                         {"record_id": "r-42", "amount": 50000})
+
+    def test_gate_string_input_sends_no_params(self):
+        from arcezia.integrations.langchain import ArceziaTool
+        tool = self._make_tool("execute_sql")
+        az = _fake_az(_allow())
+        wrapped = ArceziaTool(tool, az, domain="database_ops")
+        wrapped.run("SELECT 1")
+        self.assertIsNone(az.verify.call_args.kwargs.get("action_parameters"))
+
     def test_toolkit_wraps_multiple_tools(self):
         from arcezia.integrations.langchain import ArceziaToolkit, ArceziaTool
         az = _fake_az(_allow())
@@ -370,6 +390,30 @@ class TestOpenAIGuard(unittest.TestCase):
         )
         self.assertTrue(result.get("needs_review"))
         self.assertIsNone(result["result"])
+
+    def test_needs_review_is_present_on_every_path(self):
+        """The docs told a reader to branch on r["needs_review"]. The key was
+        set only on the REVIEW branch, so that raised KeyError on an ALLOW and
+        on a BLOCK - the two commonest outcomes."""
+        cases = [(_allow(), "SELECT 1", False), (_block(), "DROP TABLE users", False),
+                 (_review(), "DELETE FROM users WHERE id = 1", True)]
+        for cert, sql, expected in cases:
+            guard, _ = self._guard(cert)
+            result = guard.execute_tool_call(
+                self._make_tool_call("execute_sql", '{"query": "%s"}' % sql),
+                tool_implementations={"execute_sql": MagicMock(return_value="rows")},
+            )
+            self.assertIn("needs_review", result, cert.verdict)
+            self.assertEqual(result["needs_review"], expected, cert.verdict)
+
+    def test_no_implementation_still_reports_needs_review(self):
+        guard, _ = self._guard(_allow())
+        result = guard.execute_tool_call(
+            self._make_tool_call("execute_sql", '{"query": "SELECT 1"}'),
+            tool_implementations={},
+        )
+        self.assertIs(result["needs_review"], False)
+        self.assertIn("No implementation", result["error"])
 
     def test_dict_tool_call_also_supported(self):
         guard, _ = self._guard(_allow())
@@ -494,6 +538,50 @@ class TestAnthropicGuard(unittest.TestCase):
         self.assertEqual(len(safe), 0)
         self.assertEqual(len(blocked), 1)
         self.assertIs(blocked[0][0], blocks[0])
+
+    # ── dict-shaped content blocks ────────────────────────────────────────
+    # The Anthropic API hands back dicts whenever the caller works from raw
+    # JSON or `.model_dump()` rather than SDK objects. filter_tool_uses once
+    # read blocks with getattr() only, so a dict block resolved type=None, was
+    # never recognised as tool_use, and passed through the gate UNVERIFIED —
+    # the worst possible failure for a gate.
+    #
+    # Every other test in this class builds blocks with MagicMock, whose
+    # attribute access always succeeds, so none of them can catch a regression
+    # on this path. These use real dicts on purpose.
+
+    @staticmethod
+    def _dict_block(name: str, input_dict: dict) -> dict:
+        return {"type": "tool_use", "name": name,
+                "input": input_dict, "id": f"tu_{name}"}
+
+    def test_dict_block_is_gated_not_passed_through(self):
+        guard, _ = self._guard(_block(), raise_on_block=False)
+        blocks = [self._dict_block("execute_sql", {"query": "DELETE FROM users"})]
+        safe, blocked = guard.filter_tool_uses(blocks)
+        self.assertEqual(len(safe), 0, "dict tool_use block bypassed the gate")
+        self.assertEqual(len(blocked), 1)
+
+    def test_dict_block_allow_is_returned_safe(self):
+        guard, _ = self._guard(_allow(), raise_on_block=False)
+        blocks = [self._dict_block("execute_sql", {"query": "SELECT 1"})]
+        safe, blocked = guard.filter_tool_uses(blocks)
+        self.assertEqual(len(safe), 1)
+        self.assertEqual(len(blocked), 0)
+
+    def test_dict_block_is_actually_verified(self):
+        """Not just sorted into the right bucket — the engine must be called."""
+        guard, az = self._guard(_allow(), raise_on_block=False)
+        guard.filter_tool_uses([self._dict_block("execute_sql", {"query": "SELECT 1"})])
+        self.assertTrue(az.verify.called, "dict block was never sent for verification")
+
+    def test_dict_non_tool_use_block_passes_through_ungated(self):
+        guard, az = self._guard(_allow(), raise_on_block=False)
+        safe, blocked = guard.filter_tool_uses(
+            [{"type": "text", "text": "just prose"}])
+        self.assertEqual(len(safe), 1)
+        self.assertEqual(len(blocked), 0)
+        self.assertFalse(az.verify.called, "a text block should not be verified")
 
     def test_non_tool_use_blocks_pass_through(self):
         guard, _ = self._guard(_allow(), raise_on_block=False)
@@ -733,6 +821,52 @@ class TestLangGraphTool(unittest.TestCase):
         tools = ArceziaToolkit(_fake_az(_allow())).wrap_for_langgraph([self.tool])
         self.assertIsInstance(tools[0], self.BaseTool)
 
+    def test_langgraph_forwards_typed_args_as_action_parameters(self):
+        """The wrapper must forward the TYPED tool-call arguments as
+        action_parameters so registered probes can answer by key lookup
+        instead of parsing the stringified kwargs out of the description."""
+        from arcezia.integrations.langchain import as_langgraph_tool
+        az = _fake_az(_allow())
+        wrapped = as_langgraph_tool(self.tool, az)
+        wrapped.invoke({"path": "/tmp/x"})
+        kwargs = az.verify.call_args.kwargs
+        self.assertEqual(kwargs["action_parameters"], {"path": "/tmp/x"})
+
+
+class TestScalarParamsProjection(unittest.TestCase):
+    """_scalar_params must ALWAYS stay within the API bounds — the projection
+    can never turn a working tool call into a validation error."""
+
+    def _fn(self):
+        from arcezia.integrations.langchain import _scalar_params
+        return _scalar_params
+
+    def test_scalars_pass_through(self):
+        out = self._fn()({"order_id": "402", "amount_cents": 3000,
+                          "dry_run": True, "note": None})
+        self.assertEqual(out, {"order_id": "402", "amount_cents": 3000,
+                               "dry_run": True, "note": None})
+
+    def test_non_scalars_dropped(self):
+        out = self._fn()({"payload": {"nested": 1}, "items": [1, 2], "id": "x"})
+        self.assertEqual(out, {"id": "x"})
+
+    def test_long_strings_truncated_not_rejected(self):
+        out = self._fn()({"sql": "s" * 2000})
+        self.assertEqual(len(out["sql"]), 512)
+
+    def test_entry_cap_enforced(self):
+        out = self._fn()({f"k{i}": i for i in range(100)})
+        self.assertEqual(len(out), 32)
+
+    def test_empty_returns_none(self):
+        self.assertIsNone(self._fn()({}))
+        self.assertIsNone(self._fn()({"only": {"non": "scalar"}}))
+
+    def test_nonfinite_floats_dropped(self):
+        out = self._fn()({"bad": float("nan"), "ok": 1.5})
+        self.assertEqual(out, {"ok": 1.5})
+
 
 # ── Convenience constructors (docs use api_key=/task=) ────────────────────────
 
@@ -944,12 +1078,43 @@ class TestLangChainNoBypass(unittest.TestCase):
 
     def test_ungated_exec_attr_raises_instead_of_bypassing(self):
         """An execution entry point we do not gate must fail loudly, never
-        silently proxy to the unwrapped tool."""
+        silently proxy to the unwrapped tool.
+
+        This list is no longer the contract — see
+        test_unknown_attribute_is_refused_by_default. Enumerating names could
+        only ever confirm the ones already enumerated: this test passed for
+        every release in which `with_config`, `bind`, `map`, `pipe`,
+        `with_retry` and `as_tool` all executed the tool unverified, because
+        none of them was in the list it iterated.
+        """
         from arcezia.integrations.langchain import ArceziaTool
         tool = self._make_tool()
         az = _fake_az(_block())
         wrapped = ArceziaTool(tool, az, domain="database_ops")
         for attr in ("_run", "batch", "abatch", "stream", "astream", "func"):
+            with self.subTest(attr=attr):
+                with self.assertRaises(AttributeError):
+                    getattr(wrapped, attr)
+
+    def test_unknown_attribute_is_refused_by_default(self):
+        """The real contract: anything not known-inert is refused.
+
+        `BaseTool` is a `Runnable`, so every combinator returns a new Runnable
+        closed over the UNWRAPPED tool. That surface is unbounded and grows per
+        release, so a denylist of it is stale on arrival. Only the direction of
+        the check makes the guarantee hold.
+        """
+        from arcezia.integrations.langchain import ArceziaTool
+        tool = self._make_tool()
+        wrapped = ArceziaTool(tool, _fake_az(_allow()), domain="database_ops")
+
+        # Every one of these executed the tool with ZERO verify() calls under
+        # the denylist (measured, langchain_core 1.4.0).
+        for attr in ("with_config", "bind", "map", "with_retry", "pipe",
+                     "as_tool", "transform", "batch_as_completed",
+                     "astream_events", "astream_log", "with_fallbacks",
+                     "assign", "pick", "with_types",
+                     "some_method_langchain_has_not_shipped_yet"):
             with self.subTest(attr=attr):
                 with self.assertRaises(AttributeError):
                     getattr(wrapped, attr)
@@ -1084,23 +1249,41 @@ class TestAdaptersRefuseDegradedCerts(unittest.TestCase):
     """
 
     def _degraded_allow(self):
-        from arcezia.client import ArceziaCertificate
-        # Shape of the synthetic verdict the client builds when unreachable.
-        return ArceziaCertificate(
-            verdict="ALLOW", status="ALLOWED",
-            precondition_score=0.0, trust_score=0.0,
-            summary="Arcezia unreachable; degraded to ALLOW per on_error policy.",
-            violated=[], missing=[], fabrication_detected=False,
-            fabricated_constraints=[], constraints=[],
-            signature="",            # synthetic — not a signed verdict
-            credential=None,
-        )
+        from arcezia.client import Arcezia
+        # Built by the client's own fallback constructor rather than
+        # hand-assembled, so this test cannot drift from the verdict the client
+        # actually produces during an outage.
+        return Arcezia._degraded_cert("ALLOW", ConnectionError("unreachable"))
 
     def test_degraded_cert_is_recognised(self):
         cert = self._degraded_allow()
         self.assertTrue(cert.degraded)
         self.assertTrue(cert.allow)          # verdict says ALLOW …
         self.assertIsNone(cert.credential)   # … but nothing was verified
+
+    def test_genuine_verdict_without_evidence_is_not_degraded(self):
+        """A real BLOCK that ran with no grounded evidence is not an outage.
+
+        `degraded` used to be inferred from `credential is None and
+        trust_score == 0.0` — both of which hold for every genuine BLOCK on a
+        fresh integration, before any probe webhook is registered. The guide
+        tells callers to check `degraded` before `block`, so that verdict read
+        as "Arcezia is down" instead of "this action was refused".
+        """
+        from arcezia.client import ArceziaCertificate
+        real_block = ArceziaCertificate(
+            verdict="BLOCK", status="BLOCKED",
+            precondition_score=0.0, trust_score=0.0,
+            summary="Blocked: unbounded write, no WHERE clause.",
+            violated=["bounded_write"], missing=[], fabrication_detected=False,
+            fabricated_constraints=[], constraints=[],
+            signature="sig-from-engine",   # the engine signed it — it is real
+            credential=None,               # absent because BLOCK, not because outage
+        )
+        self.assertFalse(real_block.degraded)
+        self.assertTrue(real_block.block)
+        # and the synthetic one is still caught
+        self.assertTrue(self._degraded_allow().degraded)
 
     def test_universal_guard_refuses_degraded(self):
         from arcezia.integrations.universal import guard_callable

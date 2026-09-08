@@ -66,8 +66,12 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     guard.az.verify_outcome(action_type="execute_sql",
@@ -83,12 +87,15 @@ Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
 """
 from __future__ import annotations
 
+import warnings
+
 import asyncio
 import functools
 from typing import Any, Callable, Coroutine
 
 from arcezia.client import Arcezia, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._params import scalar_params
 
 
 # Domain inference from tool/function name
@@ -116,11 +123,32 @@ _DOMAIN_MAP: dict[str, str] = {
 }
 
 
+_WARNED_DOMAINS: set[str] = set()
+
+
+def _warn_inferred_domain(tool_name: str) -> None:
+    """Warn once per tool that its domain was guessed, not declared."""
+    if tool_name in _WARNED_DOMAINS:
+        return
+    _WARNED_DOMAINS.add(tool_name)
+    warnings.warn(
+        f"Arcezia: no domain declared for tool {tool_name!r} and none could be "
+        f"inferred from its name, so it will be verified against 'agent_action'. "
+        f"If this tool touches a database, the filesystem, or another domain, "
+        f"declare it explicitly — otherwise it is checked against the wrong "
+        f"rules and may be held for review with no obvious reason.",
+        stacklevel=3,
+    )
+
+
 def _infer_domain(name: str) -> str:
     lower = name.lower()
     for kw, domain in _DOMAIN_MAP.items():
         if kw in lower:
             return domain
+    # No keyword matched — a fail-safe guess, not a fact. A wrong guess
+    # surfaces later as an unexplainable hold, so say it once, plainly.
+    _warn_inferred_domain(name)
     return "agent_action"
 
 
@@ -138,9 +166,13 @@ class ArceziaAutoGenGuard:
     Compatible with both AutoGen 0.2 (sync) and AutoGen 0.4 (async).
     """
 
-    def __init__(self, az: Arcezia = None, *, api_key=None, task=None, api_url=None, capability_envelope=None):
+    def __init__(self, az: Arcezia = None, *, api_key=None, task=None, api_url=None, capability_envelope=None,
+                 data_subject_reference=None):
+        # data_subject_reference: optional identifier for the person these
+        # verifications are about. Record-only — never changes a verdict.
         self.az = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
 
     # ── AutoGen 0.2 — synchronous ──────────────────────────────────────
 
@@ -162,6 +194,8 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
+                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                action_parameters=scalar_params(kwargs),
             )
             if cert.block:
                 msg = (
@@ -170,6 +204,11 @@ class ArceziaAutoGenGuard:
                 )
                 if cert.fabrication_detected:
                     msg += f" | FABRICATION: {cert.fabricated_constraints}"
+                elif not cert.fabrication_reported:
+                    # None, not False: this server never said. Absence of an
+                    # accusation is not a clearance, and a message that omits
+                    # the line reads as one.
+                    msg += " | fabrication: not reported by this server"
                 if cert.violated:
                     msg += f" | Violated: {', '.join(cert.violated)}"
                 raise RuntimeError(msg)
@@ -186,6 +225,9 @@ class ArceziaAutoGenGuard:
                         "The action was not verified by the engine."
                     )
                 )
+            # An ALLOW whose fabrication channel never reported is not a
+            # clearance (T7). One helper, every adapter — see _common.
+            refuse_unless_clean(cert)
             return fn(*args, **kwargs)
 
         return _guarded
@@ -219,6 +261,8 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
+                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                action_parameters=scalar_params(kwargs),
             )
             if cert.block:
                 msg = (
@@ -227,6 +271,11 @@ class ArceziaAutoGenGuard:
                 )
                 if cert.fabrication_detected:
                     msg += f" | FABRICATION: {cert.fabricated_constraints}"
+                elif not cert.fabrication_reported:
+                    # None, not False: this server never said. Absence of an
+                    # accusation is not a clearance, and a message that omits
+                    # the line reads as one.
+                    msg += " | fabrication: not reported by this server"
                 if cert.violated:
                     msg += f" | Violated: {', '.join(cert.violated)}"
                 raise RuntimeError(msg)
@@ -243,6 +292,9 @@ class ArceziaAutoGenGuard:
                         "The action was not verified by the engine."
                     )
                 )
+            # An ALLOW whose fabrication channel never reported is not a
+            # clearance (T7). One helper, every adapter — see _common.
+            refuse_unless_clean(cert)
             return await fn(*args, **kwargs)
 
         return _guarded_async
@@ -266,6 +318,8 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
+                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                action_parameters=scalar_params(kwargs),
             )
             if cert.block:
                 msg = (
@@ -274,6 +328,11 @@ class ArceziaAutoGenGuard:
                 )
                 if cert.fabrication_detected:
                     msg += f" | FABRICATION: {cert.fabricated_constraints}"
+                elif not cert.fabrication_reported:
+                    # None, not False: this server never said. Absence of an
+                    # accusation is not a clearance, and a message that omits
+                    # the line reads as one.
+                    msg += " | fabrication: not reported by this server"
                 raise RuntimeError(msg)
             if cert.review:
                 raise RuntimeError(
@@ -287,6 +346,9 @@ class ArceziaAutoGenGuard:
                         "The action was not verified by the engine."
                     )
                 )
+            # An ALLOW whose fabrication channel never reported is not a
+            # clearance (T7). One helper, every adapter — see _common.
+            refuse_unless_clean(cert)
             return await asyncio.to_thread(fn, *args, **kwargs)
 
         return _guarded_as_async

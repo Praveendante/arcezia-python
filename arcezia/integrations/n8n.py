@@ -12,9 +12,17 @@ Coverage caveat — please read before relying on this integration:
     consequential node. This means:
       • Complete gate placement depends on the author following the pattern.
       • A workflow author who skips the gate can bypass verification.
-    Mitigation: use `enforce_workflow_gate` on the server to audit that every
-    verify call is followed by a credential step, so ungated paths are visible
-    in the audit trail.
+    There is NO server-side backstop for this today. An action node with no
+    check in front of it produces no record at all, so nothing detects it —
+    coverage in n8n rests entirely on the workflow author. An earlier version of
+    this note claimed an `enforce_workflow_gate` audit existed. It does not; no
+    such function was ever written.
+
+    The one structural remedy: make the action's own endpoint require the
+    short-lived single-use grant that a successful check issues. A skipped check
+    then yields nothing to present, and the action cannot succeed. This works
+    where you control the endpoint being called, and not where the action node
+    reaches a third party directly.
 
 Typical pattern (inside n8n workflow):
     1. Arcezia Verify node   →  POST https://api.arcezia.com/v1/verify
@@ -64,6 +72,9 @@ def build_verify_body(
     domain: str = "agent_action",
     session_id: Optional[str] = None,
     agent_evidence: Optional[dict] = None,
+    action_parameters: Optional[dict] = None,
+    data_subject_reference: Optional[str] = None,
+    data_categories: Optional[list] = None,
 ) -> dict:
     """
     Build a /v1/verify request body.
@@ -73,6 +84,11 @@ def build_verify_body(
 
     Returns a dict ready to pass as the JSON body of an HTTP Request node
     pointing at https://api.arcezia.com/v1/verify.
+
+    data_subject_reference: optional identifier for the person this action is
+    about. Record-only — never changes the verdict; enables per-person audit
+    lookup via POST /v1/audit/subject. data_categories: optional list of
+    personal-data category names the action touches (verdict-tightening only).
     """
     body: dict = {
         "task": task,
@@ -84,6 +100,18 @@ def build_verify_body(
         body["session_id"] = session_id
     if agent_evidence:
         body["agent_evidence"] = agent_evidence
+    if action_parameters:
+        # Structured addressing (P2): the typed tool-call arguments (record
+        # ids, paths, amounts) — forwarded to probe webhooks AND read by the
+        # engine's own probes (e.g. a numeric amount escalates
+        # action_is_high_stakes in a way prose rewording cannot evade).
+        body["action_parameters"] = action_parameters
+    if data_subject_reference is not None:
+        # Record-only: names the person the action is about so the decision
+        # can be found later per person. Never changes the verdict.
+        body["data_subject_reference"] = data_subject_reference
+    if data_categories is not None:
+        body["data_categories"] = data_categories
     return body
 
 
@@ -104,6 +132,15 @@ const body = {{
   // agent_evidence: CLAIMED quality only. For GROUNDED evidence, register
   // a probe webhook via the Arcezia admin API (POST /v1/probes).
   agent_evidence:     $input.item.json.evidence || undefined,
+  // action_parameters: the TYPED tool-call arguments (record ids, paths,
+  // amounts). Flat scalar map, max 32 keys. Probe webhooks receive it as
+  // `parameters`; the engine's own probes read it too (a numeric amount
+  // escalates stakes in a way prose rewording cannot evade).
+  action_parameters:  $input.item.json.parameters || undefined,
+  // data_subject_reference: who this action is about (your customer id).
+  // Record-only — never changes the verdict; lets you look up every decision
+  // about that person later via POST /v1/audit/subject.
+  data_subject_reference: $input.item.json.data_subject_reference || undefined,
 }};
 
 // Remove undefined keys
@@ -139,6 +176,11 @@ def workflow_template(
     Replace "Action Placeholder" with your real action node.
     """
     template = {
+        # n8n's CLI importer (`n8n import:workflow`) writes straight to the
+        # workflow_entity table, where `id` is NOT NULL — a template without one
+        # fails with SQLITE_CONSTRAINT before any node is read. The UI importer
+        # generates an id for you; the CLI does not. Verified against n8n 2.32.7.
+        "id": "arcezia-gate-template",
         "name": name,
         "nodes": [
             {
@@ -161,6 +203,72 @@ def workflow_template(
                 "position": [250, 300],
                 "id": "node-start-session",
                 "credentials": {"httpHeaderAuth": {"id": "arcezia-key", "name": "Arcezia API Key"}}
+            },
+            {
+                "parameters": {
+                    "jsCode": (
+                        "// COMPOSITION layer — describe the whole plan before any step runs.\n"
+                        "// Each step may be individually legal while the SEQUENCE is not;\n"
+                        "// /v1/verify_chain is what catches that.\n"
+                        "// NOTE: `domain` goes on EVERY STEP, not on the manifest.\n"
+                        "// The engine reads step['domain']; a step without one raises\n"
+                        "// inside the runner and comes back as an opaque HTTP 500.\n"
+                        f"const DOMAIN = '{domain}';\n"
+                        "const steps = ($json.steps || [\n"
+                        "// The key is `action_description`. A step carrying a bare\n"
+                        "// `description` parses to an EMPTY description — the step\n"
+                        "// verifies successfully against nothing at all.\n"
+                        "  { id: 'step-1', action_type: 'read_record',  action_description: 'read the source record' },\n"
+                        "  { id: 'step-2', action_type: 'update_record', action_description: 'apply the change' },\n"
+                        "]).map(s => ({ domain: DOMAIN, ...s }));\n"
+                        "return [{ json: {\n"
+                        "  task: $workflow.name,\n"
+                        "  chain_manifest: { steps },\n"
+                        "  stop_on_block: true,\n"
+                        "  session_id: $('Start Session').item.json.session_id,\n"
+                        "} }];"
+                    )
+                },
+                "name": "Build Chain Manifest",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [450, 300],
+                "id": "node-build-chain"
+            },
+            {
+                "parameters": {
+                    "method": "POST",
+                    "url": f"{arcezia_api_url}/v1/verify_chain",
+                    "authentication": "genericCredentialType",
+                    "genericAuthType": "httpHeaderAuth",
+                    "sendBody": True,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify($json) }}",
+                    "options": {}
+                },
+                "name": "Verify Chain",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4,
+                "position": [650, 300],
+                "id": "node-verify-chain",
+                "credentials": {"httpHeaderAuth": {"id": "arcezia-key", "name": "Arcezia API Key"}}
+            },
+            {
+                "parameters": {
+                    "rules": {
+                        "values": [
+                            {"conditions": {"options": {"caseSensitive": True}, "combinator": "and", "conditions": [{"leftValue": "={{ $json.overall_verdict }}", "rightValue": "SAFE", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": True, "outputKey": "safe"},
+                            {"conditions": {"options": {"caseSensitive": True}, "combinator": "and", "conditions": [{"leftValue": "={{ $json.overall_verdict }}", "rightValue": "REVIEW_REQUIRED", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": True, "outputKey": "review"}
+                        ],
+                        "fallbackOutput": "extra"
+                    },
+                    "options": {"fallbackOutput": "extra"}
+                },
+                "name": "Route on Chain",
+                "type": "n8n-nodes-base.switch",
+                "typeVersion": 3,
+                "position": [850, 300],
+                "id": "node-route-chain"
             },
             {
                 "parameters": {
@@ -197,9 +305,13 @@ def workflow_template(
                             {"conditions": {"options": {"caseSensitive": True}, "combinator": "and", "conditions": [{"leftValue": "={{ $json.verdict }}", "rightValue": "ALLOW", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": True, "outputKey": "allow"},
                             {"conditions": {"options": {"caseSensitive": True}, "combinator": "and", "conditions": [{"leftValue": "={{ $json.verdict }}", "rightValue": "BLOCK", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": True, "outputKey": "block"},
                             {"conditions": {"options": {"caseSensitive": True}, "combinator": "and", "conditions": [{"leftValue": "={{ $json.verdict }}", "rightValue": "REVIEW", "operator": {"type": "string", "operation": "equals"}}]}, "renameOutput": True, "outputKey": "review"}
-                        ]
+                        ],
+                        # Anything that is not ALLOW / BLOCK / REVIEW — including
+                        # SEMANTIC_BLOCK — falls through here and is treated as a stop.
+                        # Never let an unrecognised verdict reach the action node.
+                        "fallbackOutput": "extra"
                     },
-                    "options": {}
+                    "options": {"fallbackOutput": "extra"}
                 },
                 "name": "Route on Verdict",
                 "type": "n8n-nodes-base.switch",
@@ -243,43 +355,99 @@ def workflow_template(
                 "credentials": {"httpHeaderAuth": {"id": "arcezia-key", "name": "Arcezia API Key"}}
             },
             {
+                # Real node, not a sticky note: a blocked path must actually stop
+                # the run. A comment box lets execution fall off the end silently.
                 "parameters": {
-                    "content": "## ❌ Arcezia BLOCK\n**Reason:** {{ $('Arcezia Verify').item.json.summary }}\n\nThis action was blocked by Arcezia safety verification.",
-                    "height": 200,
-                    "width": 300
+                    "errorMessage": "=Arcezia blocked this run: {{ $json.summary || $json.overall_verdict || $json.verdict }}"
                 },
-                "name": "Block Handler",
-                "type": "n8n-nodes-base.stickyNote",
+                "name": "Blocked - Stop Run",
+                "type": "n8n-nodes-base.stopAndError",
                 "typeVersion": 1,
                 "position": [1050, 150],
-                "id": "node-block-note"
+                "id": "node-blocked-stop"
             },
             {
+                # Replace the URL with your real action. Left as a live HTTP node
+                # so the template runs end to end out of the box.
+                # The single-use credential from the ALLOW is forwarded here — if
+                # your endpoint requires it, an ungated action cannot succeed.
                 "parameters": {
-                    "content": "🔧 Replace this placeholder with your\nactual action node (HTTP Request, Write\nFile, etc.).\n\nOn the ALLOW path, the arcezia credential\nis available at:\n{{ $('Arcezia Verify').item.json.credential }}",
-                    "height": 200,
-                    "width": 300
+                    "method": "POST",
+                    "url": "https://httpbin.org/post",
+                    "sendHeaders": True,
+                    "headerParameters": {
+                        "parameters": [
+                            # .token, not the whole object — the response returns
+                            # {token, expires_at, action_type}, and interpolating
+                            # the object into a header sends "[object Object]".
+                            {"name": "X-Arcezia-Credential", "value": "={{ $('Arcezia Verify').item.json.credential.token }}"}
+                        ]
+                    },
+                    "sendBody": True,
+                    "specifyBody": "json",
+                    "jsonBody": "={{ JSON.stringify({ action: $('Build Verify Body').item.json.action_type }) }}",
+                    "options": {}
                 },
-                "name": "Action Placeholder",
-                "type": "n8n-nodes-base.stickyNote",
-                "typeVersion": 1,
+                "name": "Action (Replace Me)",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4,
                 "position": [1050, 300],
-                "id": "node-action-note"
+                "id": "node-action"
+            },
+            {
+                # AUDIT layer — report what actually happened back to Arcezia.
+                # Without this the record ends at "we allowed it", not "here is
+                # what it did".
+                "parameters": {
+                    "method": "POST",
+                    "url": f"{arcezia_api_url}/v1/verify_outcome",
+                    "authentication": "genericCredentialType",
+                    "genericAuthType": "httpHeaderAuth",
+                    "sendBody": True,
+                    "specifyBody": "json",
+                    "jsonBody": (
+                        "={{ JSON.stringify({"
+                        " session_id: $('Start Session').item.json.session_id,"
+                        " action_type: $('Build Verify Body').item.json.action_type,"
+                        " action_description: $('Build Verify Body').item.json.action_description,"
+                        " outcome: { status_code: $json.statusCode || 200 }"
+                        "}) }}"
+                    ),
+                    "options": {}
+                },
+                "name": "Verify Outcome",
+                "type": "n8n-nodes-base.httpRequest",
+                "typeVersion": 4,
+                "position": [1250, 300],
+                "id": "node-verify-outcome",
+                "credentials": {"httpHeaderAuth": {"id": "arcezia-key", "name": "Arcezia API Key"}}
             }
         ],
         "connections": {
-            "Start Session": {"main": [[{"node": "Build Verify Body", "type": "main", "index": 0}]]},
+            # MEMORY → COMPOSITION → GATE → action → AUDIT
+            "Start Session": {"main": [[{"node": "Build Chain Manifest", "type": "main", "index": 0}]]},
+            "Build Chain Manifest": {"main": [[{"node": "Verify Chain", "type": "main", "index": 0}]]},
+            "Verify Chain": {"main": [[{"node": "Route on Chain", "type": "main", "index": 0}]]},
+            "Route on Chain": {
+                "main": [
+                    [{"node": "Build Verify Body", "type": "main", "index": 0}],        # SAFE
+                    [{"node": "Wait for Human Approval", "type": "main", "index": 0}],  # REVIEW_REQUIRED
+                    [{"node": "Blocked - Stop Run", "type": "main", "index": 0}]        # BLOCKED / SEMANTIC_BLOCK
+                ]
+            },
             "Build Verify Body": {"main": [[{"node": "Arcezia Verify", "type": "main", "index": 0}]]},
             "Arcezia Verify": {"main": [[{"node": "Route on Verdict", "type": "main", "index": 0}]]},
             "Route on Verdict": {
                 "main": [
-                    [{"node": "Action Placeholder", "type": "main", "index": 0}],
-                    [{"node": "Block Handler", "type": "main", "index": 0}],
-                    [{"node": "Wait for Human Approval", "type": "main", "index": 0}]
+                    [{"node": "Action (Replace Me)", "type": "main", "index": 0}],      # ALLOW
+                    [{"node": "Blocked - Stop Run", "type": "main", "index": 0}],       # BLOCK
+                    [{"node": "Wait for Human Approval", "type": "main", "index": 0}],  # REVIEW
+                    [{"node": "Blocked - Stop Run", "type": "main", "index": 0}]        # anything else
                 ]
             },
             "Wait for Human Approval": {"main": [[{"node": "Authorize (Human Approved)", "type": "main", "index": 0}]]},
-            "Authorize (Human Approved)": {"main": [[{"node": "Arcezia Verify", "type": "main", "index": 0}]]}
+            "Authorize (Human Approved)": {"main": [[{"node": "Arcezia Verify", "type": "main", "index": 0}]]},
+            "Action (Replace Me)": {"main": [[{"node": "Verify Outcome", "type": "main", "index": 0}]]}
         },
         "pinData": {},
         "settings": {"executionOrder": "v1"},

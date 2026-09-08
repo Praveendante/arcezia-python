@@ -36,12 +36,15 @@ unchanged signature. Both sync and async callables are supported.
 """
 from __future__ import annotations
 
+import warnings
+
 import asyncio
 import functools
 from typing import Any, Callable, Optional
 
 from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._params import scalar_params
 
 
 # Lightweight name → domain inference (kept independent of any other adapter).
@@ -57,11 +60,32 @@ _DOMAIN_MAP = {
 }
 
 
+_WARNED_DOMAINS: set[str] = set()
+
+
+def _warn_inferred_domain(tool_name: str) -> None:
+    """Warn once per tool that its domain was guessed, not declared."""
+    if tool_name in _WARNED_DOMAINS:
+        return
+    _WARNED_DOMAINS.add(tool_name)
+    warnings.warn(
+        f"Arcezia: no domain declared for tool {tool_name!r} and none could be "
+        f"inferred from its name, so it will be verified against 'agent_action'. "
+        f"If this tool touches a database, the filesystem, or another domain, "
+        f"declare it explicitly — otherwise it is checked against the wrong "
+        f"rules and may be held for review with no obvious reason.",
+        stacklevel=3,
+    )
+
+
 def _infer_domain(name: str) -> str:
     lower = name.lower()
     for kw, domain in _DOMAIN_MAP.items():
         if kw in lower:
             return domain
+    # No keyword matched — a fail-safe guess, not a fact. A wrong guess
+    # surfaces later as an unexplainable hold, so say it once, plainly.
+    _warn_inferred_domain(name)
     return "agent_action"
 
 
@@ -83,6 +107,7 @@ def guard_callable(
     api_url: Optional[str] = None,
     capability_envelope: Optional[dict] = None,
     evidence_provider: Optional[Callable] = None,
+    data_subject_reference: Optional[str] = None,
 ) -> Callable:
     """
     Return a verification-guarded version of ``fn``.
@@ -94,6 +119,9 @@ def guard_callable(
         allowed_domains, max_scope). Injected into the session on creation.
     evidence_provider: Optional callable(action_type, args, kwargs) → dict.
         Returns agent_evidence for llm_inferred constraints.
+    data_subject_reference: Optional identifier for the person this tool's
+        actions are about, attached to every verification the wrapper makes.
+        Record-only — never changes a verdict.
     """
     client = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
                        capability_envelope=capability_envelope)
@@ -107,11 +135,20 @@ def guard_callable(
                 ev = evidence_provider(atype, args, kwargs)
             except Exception:
                 pass  # evidence provider failure = Ω, never a block
+        # Per-call subject kwarg only when set: keeps the call compatible with
+        # user-supplied clients whose verify() predates the parameter.
+        _subject_kw = (
+            {"data_subject_reference": data_subject_reference}
+            if data_subject_reference is not None else {}
+        )
         cert = client.verify(
             action_type=atype,
             action_description=_describe(atype, args, kwargs),
             domain=dom,
             agent_evidence=ev,
+            # Typed keyword arguments -> probe lookup keys (bounds-safe).
+            action_parameters=scalar_params(kwargs),
+            **_subject_kw,
         )
         if cert.block:
             raise ArceziaBlockError(cert)
@@ -128,6 +165,20 @@ def guard_callable(
                     "The action was not verified by the engine."
                 )
             )
+        # The fail-closed reading of the auxiliary flags (T7). `cert.allow`
+        # gates on `verdict`, which is the decision and is always present; that
+        # is left exactly as it was. This is the second question: did the
+        # evidence behind that decision actually get REPORTED? A response that
+        # omits `fabrication_detected` used to parse as "no fabrication" — an
+        # absence read as a clearance. It now parses as None, and one shared
+        # helper, called at every adapter's refusal point, turns that unknown
+        # into a refusal, so nothing executes on a verdict whose fabrication
+        # channel never spoke.
+        #
+        # Reached only on an ALLOW that is neither blocked, held, nor degraded,
+        # so on any server that reports the flag (every current deployment)
+        # it makes no difference at all.
+        refuse_unless_clean(cert)
         return cert
 
     if asyncio.iscoroutinefunction(fn):
@@ -160,6 +211,7 @@ def guard(
     api_url: Optional[str] = None,
     capability_envelope: Optional[dict] = None,
     evidence_provider: Optional[Callable] = None,
+    data_subject_reference: Optional[str] = None,
 ):
     """
     Decorator factory. Equivalent to ``guard_callable`` applied as a decorator:
@@ -175,5 +227,6 @@ def guard(
             api_key=api_key, task=task, api_url=api_url,
             capability_envelope=capability_envelope,
             evidence_provider=evidence_provider,
+            data_subject_reference=data_subject_reference,
         )
     return decorator

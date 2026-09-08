@@ -33,6 +33,23 @@ def test_build_verify_body_full():
     assert body["agent_evidence"] == {"env_is_staging": False}
 
 
+def test_build_verify_body_action_parameters():
+    from arcezia.integrations.n8n import build_verify_body
+    body = build_verify_body(
+        task="t", action_type="update_record", action_description="d",
+        action_parameters={"record_id": "r-42", "amount": 50000},
+    )
+    assert body["action_parameters"] == {"record_id": "r-42", "amount": 50000}
+    # Omitted → key absent (not null) so the request body stays minimal.
+    body2 = build_verify_body(task="t", action_type="a", action_description="d")
+    assert "action_parameters" not in body2
+
+
+def test_code_snippet_mentions_action_parameters():
+    from arcezia.integrations.n8n import n8n_code_snippet
+    assert "action_parameters" in n8n_code_snippet()
+
+
 def test_code_snippet_is_javascript():
     from arcezia.integrations.n8n import n8n_code_snippet
     snippet = n8n_code_snippet(domain="filesystem_ops")

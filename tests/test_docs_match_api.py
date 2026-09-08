@@ -261,7 +261,12 @@ class TestDocumentedCallsMatchSignatures(unittest.TestCase):
         for label, code in _python_snippets():
             if "verify_chain" not in code:
                 continue
-            for block in re.findall(r'verify_chain\((.*?)\n\s*\}\)', code, re.S):
+            # `\}\s*[,)]` not `\}\)`: the README passes a second argument
+            # (`}, stop_on_block=True)`), so the tighter pattern silently
+            # skipped the one example that actually had the defect — it used
+            # "id" in the REQUEST. A check that cannot see the offending case
+            # is not a check.
+            for block in re.findall(r'verify_chain\((.*?)\n\s*\}\s*[,)]', code, re.S):
                 if re.search(r'"id"\s*:', block):
                     offenders.append(f'{label}: chain step uses "id" — should be "step_id"')
         self.assertEqual(offenders, [], "\n  ".join(offenders))

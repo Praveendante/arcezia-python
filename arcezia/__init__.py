@@ -52,10 +52,16 @@ Level 2 — Chain verification (verify the plan, not just the step)
             ]
         }, stop_on_block=True)
 
-        # {overall_verdict, blocked_at, steps[], semantic_triggers, final_state}
-        # No top-level "verdict" — per-step verdicts are under steps[].
-        if result["overall_verdict"] != "SAFE":
-            abort(result["blocked_at"])       # the step_id that failed
+        # An ArceziaChainResult: .overall_verdict, .blocked_at, .steps,
+        # .semantic_triggers, .human_summary, .degraded — plus .raw for
+        # anything else the server sent (final_state, ...).
+        # No top-level "verdict" — per-step verdicts are under .steps.
+        if not result.safe:
+            abort(result.blocked_at)          # the step_id that failed
+
+        # Dict indexing (result["overall_verdict"]) still works and is
+        # deprecated; .safe is stricter — it is False on a degraded result,
+        # whose overall_verdict reads "SAFE" under on_error="fail_open".
 
     Post-execution audit — did reality match the prediction?
 
@@ -97,22 +103,27 @@ Integrations — all implement Level 1 and expose ``.az`` for Levels 2-4:
     # n8n:          arcezia.integrations.n8n.workflow_template()
 """
 from arcezia.client import (  # noqa: F401
+    _SDK_VERSION,
     Arcezia,
     ArceziaCertificate,
+    ArceziaChainResult,
+    ArceziaOutcomeResult,
     ArceziaBlockError,
     ArceziaReviewError,
     ArceziaUpgradeRequired,
     ArceziaRateLimitError,
     ArceziaUnavailableError,
+    ArceziaTransportError,
     ArceziaAPIError,
     ArceziaAuthError,
 )
 from arcezia.integrations.universal import guard, guard_callable  # noqa: F401
 
-__version__ = "1.0.3"
+__version__ = _SDK_VERSION
 __all__ = [
-    "Arcezia", "ArceziaCertificate", "ArceziaBlockError", "ArceziaReviewError",
+    "Arcezia", "ArceziaCertificate", "ArceziaChainResult",
+    "ArceziaOutcomeResult", "ArceziaBlockError", "ArceziaReviewError",
     "ArceziaUpgradeRequired", "ArceziaRateLimitError", "ArceziaUnavailableError",
-    "ArceziaAPIError", "ArceziaAuthError",
+    "ArceziaTransportError", "ArceziaAPIError", "ArceziaAuthError",
     "guard", "guard_callable",
 ]

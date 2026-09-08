@@ -29,6 +29,8 @@ import os
 import sys
 from typing import Optional
 
+from arcezia.integrations._params import scalar_params
+
 # Tools that never produce an irreversible effect — pass straight through.
 _READ_ONLY_TOOLS = frozenset({
     "Read", "Glob", "Grep", "LS", "NotebookRead", "TodoWrite", "TodoRead",
@@ -80,7 +82,7 @@ def _decision(permission: str, reason: str) -> dict:
     }
 
 
-def run_hook(stdin_text: str, *, verifier=None) -> dict:
+def run_hook(stdin_text: str, *, verifier=None, data_subject_reference=None) -> dict:
     """
     Pure hook core (no I/O) — returns the JSON dict to print.
 
@@ -89,6 +91,12 @@ def run_hook(stdin_text: str, *, verifier=None) -> dict:
     real Arcezia client built from env (ARCEZIA_API_KEY, ARCEZIA_API_URL, TASK).
     On any client/transport error the client's own on_error policy decides
     (default fail-closed → we surface "deny").
+
+    `data_subject_reference`: optional identifier for the person this tool call
+    is about, attached to the verification. Record-only — never changes the
+    verdict. In the default CLI mode set ARCEZIA_DATA_SUBJECT in the
+    environment instead. Applied only when the verifier supports it (the real
+    client does); a custom verifier without set_data_subject is left alone.
     """
     try:
         payload = json.loads(stdin_text) if stdin_text.strip() else {}
@@ -111,11 +119,35 @@ def run_hook(stdin_text: str, *, verifier=None) -> dict:
             # No API key configured — do not silently allow a consequential tool.
             return _decision("ask", "Arcezia not configured (set ARCEZIA_API_KEY); manual review.")
 
+    if data_subject_reference is not None and callable(
+        getattr(verifier, "set_data_subject", None)
+    ):
+        verifier.set_data_subject(data_subject_reference)
+
+    # Typed hook tool_input -> probe lookup keys (bounds-safe projection).
+    # The verifier contract predates action_parameters, and a user-supplied
+    # verifier with a strict .verify signature would raise TypeError on the
+    # extra kwarg — which the fail-closed handler below would convert into a
+    # DENY, breaking a working setup. Pass it only when the verifier's
+    # signature accepts it (named or **kwargs); otherwise omit — behaviour is
+    # then exactly the pre-change contract.
+    _extra: dict = {}
+    try:
+        import inspect as _inspect
+        _sig_params = _inspect.signature(verifier.verify).parameters
+        if "action_parameters" in _sig_params or any(
+            p.kind is _inspect.Parameter.VAR_KEYWORD for p in _sig_params.values()
+        ):
+            _extra["action_parameters"] = scalar_params(tool_input)
+    except (TypeError, ValueError):
+        pass  # unintrospectable verifier — omit the kwarg, never break the call
+
     try:
         cert = verifier.verify(
             action_type=action_type,
             action_description=action_description,
             domain=domain,
+            **_extra,
         )
     except Exception as exc:  # fail-closed default surfaces here
         return _decision("deny", f"Arcezia could not verify the action (fail-closed): {exc}")
@@ -124,6 +156,13 @@ def run_hook(stdin_text: str, *, verifier=None) -> dict:
         return _decision("deny", f"Arcezia BLOCK: {cert.summary}")
     if cert.degraded:
         return _decision("deny", f"Arcezia DENY (degraded cert — unverified): {cert.summary}")
+    if not cert.is_clean():
+        # T7: the server did not report whether fabricated evidence was found
+        # (or a cross-step pattern fired). An unreported check is not a passed
+        # one, and this hook is a gate, so the unknown denies.
+        return _decision(
+            "deny",
+            f"Arcezia DENY (not cleared: {cert.fabrication_status}): {cert.summary}")
     if cert.review:
         # Default: "ask" (prompt the human — their keystroke grounds the action).
         # Strict mode (ARCEZIA_REVIEW_MODE=deny): REVIEW halts HARD — the agent
@@ -165,7 +204,16 @@ def _default_verifier():
         task=os.environ.get("TASK", os.environ.get("ARCEZIA_TASK", "")),
         api_url=os.environ.get("ARCEZIA_API_URL", "https://api.arcezia.com"),
         on_error=os.environ.get("ARCEZIA_ON_ERROR", "fail_closed"),
+        # Record-only data subject for per-person audit lookup; the hook is
+        # env-configured, so the env var is its constructor.
+        data_subject_reference=os.environ.get("ARCEZIA_DATA_SUBJECT") or None,
     )
+    # The hook denies on a degraded certificate (see the PreToolUse handler),
+    # so ARCEZIA_ON_ERROR=fail_open does not keep Claude Code running through
+    # an outage — it changes nothing here. Said once, at construction.
+    from arcezia.integrations._common import warn_if_fail_open
+    warn_if_fail_open(az)
+
     # Load capability_envelope from config (human-defined authority scope)
     envelope = _load_capability_envelope()
     if envelope:

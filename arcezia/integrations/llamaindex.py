@@ -35,8 +35,12 @@ reached through ``toolkit.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     toolkit.az.verify_outcome(action_type="execute_sql",
@@ -73,16 +77,20 @@ def _require_llamaindex():
 
 def guard_tool(tool: "FunctionTool", az: Any = None, *, domain: Optional[str] = None,
                block_on_review: bool = True, api_key=None, task=None, api_url=None,
-               capability_envelope=None) -> "FunctionTool":
+               capability_envelope=None, data_subject_reference=None) -> "FunctionTool":
     """
     Return a new FunctionTool whose function is Arcezia-verified before it runs.
 
     Preserves the tool's name, description and parameter schema. Handles both
     sync and async LlamaIndex tools.
+
+    data_subject_reference: optional identifier for the person these
+    verifications are about. Record-only — never changes a verdict.
     """
     _require_llamaindex()
     client = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
     name = tool.metadata.name
     description = tool.metadata.description
     resolved_domain = domain or _infer_domain(name or "")
@@ -113,10 +121,14 @@ def guard_tool(tool: "FunctionTool", az: Any = None, *, domain: Optional[str] = 
 class ArceziaLlamaToolkit:
     """Wraps a list of LlamaIndex FunctionTools with Arcezia verification."""
 
-    def __init__(self, az: Any = None, *, api_key=None, task=None, api_url=None, capability_envelope=None):
+    def __init__(self, az: Any = None, *, api_key=None, task=None, api_url=None, capability_envelope=None,
+                 data_subject_reference=None):
+        # data_subject_reference: optional identifier for the person these
+        # verifications are about. Record-only — never changes a verdict.
         _require_llamaindex()
         self._az = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
 
     @property
     def az(self):

@@ -51,8 +51,12 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     guard.az.verify_outcome(action_type="execute_sql",
@@ -68,11 +72,14 @@ Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
 """
 from __future__ import annotations
 
+import warnings
+
 import functools
 from typing import Any, Callable, ClassVar
 
 from arcezia.client import ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._params import scalar_params
 
 
 # Domain routing: map function name patterns to Arcezia domains
@@ -92,11 +99,47 @@ _DOMAIN_MAP: dict[str, str] = {
 }
 
 
+_WARNED_DOMAINS: set[str] = set()
+
+
+def _fabrication_note(cert) -> str:
+    """The fabrication clause of a BLOCK message — three states, not two.
+
+    `fabrication_detected` is None when the server did not report it (an older
+    deployment, or a degraded certificate this SDK built locally). Rendering
+    that the same as False would print nothing, and a silent message reads as
+    "checked, clean". It is not; say so.
+    """
+    if cert.fabrication_detected is True:
+        return f" | FABRICATION: {cert.fabricated_constraints}"
+    if cert.fabrication_detected is None:
+        return " | fabrication: not reported by this server"
+    return ""
+
+
+def _warn_inferred_domain(tool_name: str) -> None:
+    """Warn once per tool that its domain was guessed, not declared."""
+    if tool_name in _WARNED_DOMAINS:
+        return
+    _WARNED_DOMAINS.add(tool_name)
+    warnings.warn(
+        f"Arcezia: no domain declared for tool {tool_name!r} and none could be "
+        f"inferred from its name, so it will be verified against 'agent_action'. "
+        f"If this tool touches a database, the filesystem, or another domain, "
+        f"declare it explicitly — otherwise it is checked against the wrong "
+        f"rules and may be held for review with no obvious reason.",
+        stacklevel=3,
+    )
+
+
 def _infer_domain(name: str) -> str:
     name_lower = name.lower()
     for kw, domain in _DOMAIN_MAP.items():
         if kw in name_lower:
             return domain
+    # No keyword matched — a fail-safe guess, not a fact. A wrong guess
+    # surfaces later as an unexplainable hold, so say it once, plainly.
+    _warn_inferred_domain(name)
     return "agent_action"
 
 
@@ -107,9 +150,13 @@ class ArceziaGuard:
     (OpenAI, Anthropic tool_use, etc.)
     """
 
-    def __init__(self, az=None, *, api_key=None, task=None, api_url=None, capability_envelope=None):
+    def __init__(self, az=None, *, api_key=None, task=None, api_url=None, capability_envelope=None,
+                 data_subject_reference=None):
+        # data_subject_reference: optional identifier for the person these
+        # verifications are about. Record-only — never changes a verdict.
         self._az = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
 
     @property
     def az(self):
@@ -139,7 +186,14 @@ class ArceziaGuard:
         tool_implementations:  {"function_name": callable}
         domain_overrides:      {"function_name": "database_ops"} overrides domain inference
 
-        Returns: {"result": ..., "cert": ArceziaCertificate, "blocked": bool}
+        Returns: {"result": ..., "cert": ArceziaCertificate, "blocked": bool,
+                  "needs_review": bool}, plus "error" whenever result is None.
+
+        `needs_review` is present on every path. It used to be set only on the
+        REVIEW branch, so the documented `r["needs_review"]` raised KeyError on
+        an ALLOW and on a BLOCK — the two commonest outcomes. Both `blocked`
+        and `needs_review` are True on REVIEW: nothing ran, and a person can
+        clear it.
         """
         import json
         overrides = domain_overrides or {}
@@ -164,6 +218,8 @@ class ArceziaGuard:
             action_type=fn_name,
             action_description=description,
             domain=domain,
+            # Typed function-call arguments → probe lookup keys (bounds-safe).
+            action_parameters=scalar_params(fn_args if isinstance(fn_args, dict) else None),
         )
 
         if cert.block:
@@ -171,11 +227,11 @@ class ArceziaGuard:
                 "result": None,
                 "error": (
                     f"[Arcezia BLOCK] {cert.summary}"
-                    + (f" | FABRICATION: {cert.fabricated_constraints}"
-                       if cert.fabrication_detected else "")
+                    + _fabrication_note(cert)
                 ),
                 "cert": cert,
                 "blocked": True,
+                "needs_review": False,
             }
         if cert.review:
             return {
@@ -195,6 +251,9 @@ class ArceziaGuard:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
 
         fn = tool_implementations.get(fn_name)
         if fn is None:
@@ -203,10 +262,12 @@ class ArceziaGuard:
                 "error": f"No implementation for '{fn_name}'",
                 "cert": cert,
                 "blocked": False,
+                "needs_review": False,
             }
 
         result = fn(**fn_args) if isinstance(fn_args, dict) else fn(fn_args)
-        return {"result": result, "cert": cert, "blocked": False}
+        return {"result": result, "cert": cert, "blocked": False,
+                "needs_review": False}
 
     def wrap_function(
         self,
@@ -229,12 +290,13 @@ class ArceziaGuard:
                 action_type=name,
                 action_description=description,
                 domain=effective_domain,
+                # Typed keyword arguments → probe lookup keys (bounds-safe).
+                action_parameters=scalar_params(kwargs),
             )
             if cert.block:
                 raise RuntimeError(
                     f"[Arcezia BLOCK] {cert.summary}"
-                    + (f" | FABRICATION: {cert.fabricated_constraints}"
-                       if cert.fabrication_detected else "")
+                    + _fabrication_note(cert)
                 )
             if cert.review:
                 raise RuntimeError(
@@ -248,6 +310,9 @@ class ArceziaGuard:
                         "The action was not verified by the engine."
                     )
                 )
+            # An ALLOW whose fabrication channel never reported is not a
+            # clearance (T7). One helper, every adapter — see _common.
+            refuse_unless_clean(cert)
             return fn(*args, **kwargs)
 
         return safe_fn
@@ -317,6 +382,8 @@ class ArceziaCrewTool:
             action_type=getattr(self, "name", "unnamed_tool"),
             action_description=str(first)[:300],
             domain=self.domain,
+            # Typed keyword arguments → probe lookup keys (bounds-safe).
+            action_parameters=scalar_params(kwargs),
         )
         # Raise — never return a string. Returning "[BLOCKED]..." hands the
         # block message to the LLM which may rephrase and retry. An exception
@@ -325,8 +392,7 @@ class ArceziaCrewTool:
             raise RuntimeError(
                 f"[Arcezia BLOCK] {cert.summary} | "
                 f"trust={cert.trust_score:.0%}"
-                + (f" | FABRICATION: {cert.fabricated_constraints}"
-                   if cert.fabrication_detected else "")
+                + _fabrication_note(cert)
             )
         if cert.review:
             raise RuntimeError(
@@ -340,6 +406,9 @@ class ArceziaCrewTool:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
 
     def run(self, *args, **kwargs) -> str:
         # The gate lives on _run (installed by __init_subclass__), so it holds

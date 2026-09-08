@@ -94,6 +94,19 @@ class TestOrdinaryVerdictsAreUntouched(unittest.TestCase):
         self.assertIsNone(cert.chain_status)
         self.assertFalse(cert.block)
 
+    def test_an_explicit_CLEAR_still_allows(self):
+        """The server's explicit negative — the scan ran and nothing fired.
+
+        It must gate exactly like a plain ALLOW. The only thing "CLEAR" adds
+        over an absent key is that a reader can now tell the scan RAN
+        (`chain_status_reported`); it must never itself become a refusal.
+        """
+        cert = _parse_cert(_wire(chain_status="CLEAR"))
+        self.assertTrue(cert.allow)
+        self.assertFalse(cert.block)
+        self.assertFalse(cert.semantic_block)
+        self.assertTrue(cert.chain_status_reported)
+
     def test_synthetic_certificates_construct(self):
         """Degraded certs bypass the wire parser — both fields need defaults."""
         cert = ArceziaCertificate(

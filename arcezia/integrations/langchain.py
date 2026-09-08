@@ -38,8 +38,12 @@ reached through ``toolkit.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     toolkit.az.verify_outcome(action_type="execute_sql",
@@ -55,10 +59,12 @@ Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
 """
 from __future__ import annotations
 
+import warnings
+
 from typing import Any
 
 from arcezia.client import ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._common import coerce_az, warn_if_fail_open, refuse_unless_clean
 
 try:
     from langchain.tools import BaseTool
@@ -104,20 +110,66 @@ _TOOL_DOMAIN_MAP = {
 }
 
 
+_WARNED_DOMAINS: set[str] = set()
+
+
+def _warn_inferred_domain(tool_name: str) -> None:
+    """Warn once per tool that its domain was guessed, not declared."""
+    if tool_name in _WARNED_DOMAINS:
+        return
+    _WARNED_DOMAINS.add(tool_name)
+    warnings.warn(
+        f"Arcezia: no domain declared for tool {tool_name!r} and none could be "
+        f"inferred from its name, so it will be verified against 'agent_action'. "
+        f"If this tool touches a database, the filesystem, or another domain, "
+        f"declare it (domain_overrides={{'{tool_name}': 'database_ops'}} or "
+        f"domain=...) — otherwise it is checked against the wrong rules and may "
+        f"be held for review with no obvious reason.",
+        stacklevel=3,
+    )
+
+
 def _infer_domain(tool_name: str) -> str:
     name_lower = tool_name.lower()
     for kw, domain in _TOOL_DOMAIN_MAP.items():
         if kw in name_lower:
             return domain
+    # No keyword matched. Falling back to the general domain is the fail-safe
+    # choice, but it is a GUESS, and a wrong guess shows up later as a verdict
+    # the caller cannot explain: a database tool checked against agent_action
+    # rules, held because the envelope allows a different domain. Extending the
+    # keyword list is not the fix — it is unbounded and language-bound. Saying
+    # so once, plainly, is: the caller knows their tool's domain and can set it.
+    _warn_inferred_domain(tool_name)
     return "agent_action"
 
 
-# Execution entry points on a LangChain BaseTool. Those NOT explicitly gated on
-# ArceziaTool must never fall through __getattr__ to the unwrapped tool — that
-# would execute the action unverified. Gated here: run, arun, invoke, ainvoke.
-_UNGATED_EXEC_ATTRS = frozenset({
-    "_run", "_arun", "batch", "abatch", "stream", "astream",
-    "func", "coroutine", "run_sync",
+# Attributes safe to proxy to the unwrapped tool: inert metadata and schema
+# introspection that LangChain reads to DESCRIBE a tool. Nothing here can run
+# the tool.
+#
+# This is an ALLOWLIST, and that direction is the whole point. It used to be a
+# denylist of nine execution entry points, which cannot work: `BaseTool` is a
+# `Runnable`, and every Runnable combinator returns a new Runnable that closes
+# over the UNWRAPPED tool and executes it. That surface is unbounded and grows
+# with each LangChain release, so any enumeration of it is stale on arrival.
+#
+# Measured against langchain_core 1.4.0 — each of these executed the tool with
+# ZERO verification calls under the denylist:
+#     with_config, bind, map, with_retry, pipe, as_tool,
+#     transform, batch_as_completed, astream_events, astream_log
+# `with_config` and `bind` are ordinary agent plumbing, so this was reachable
+# in normal use, not only by an adversary.
+#
+# Unknown attribute now raises AttributeError, which is both the correct Python
+# meaning of "this wrapper does not have that" and the fail-closed answer: a
+# caller reaching for an ungated execution path gets an error naming the gated
+# alternative, never a silent unverified run.
+_PROXY_SAFE_ATTRS = frozenset({
+    "name", "description", "args", "args_schema", "tool_call_schema",
+    "return_direct", "metadata", "tags", "verbose", "callbacks",
+    "handle_tool_error", "handle_validation_error", "response_format",
+    "get_input_schema", "get_output_schema", "is_single_input",
 })
 
 
@@ -136,6 +188,11 @@ class ArceziaTool:
         _require_langchain()
         self._tool = tool
         self._az = az
+        # This one is constructed with a client directly rather than through
+        # coerce_az, so the fail_open contradiction has to be said here too —
+        # `_gate` below refuses a degraded certificate exactly like every other
+        # adapter, whatever the client's on_error says.
+        warn_if_fail_open(az)
         self._domain = domain or _infer_domain(tool.name)
         # Expose LangChain tool interface
         self.name = tool.name
@@ -156,12 +213,22 @@ class ArceziaTool:
             action_type=self._tool.name,
             action_description=input_str,
             domain=self._domain,
+            # Structured addressing (P2): forward the TYPED tool args exactly
+            # as the StructuredTool path (wrap_tool_for_langgraph) does — this
+            # classic path used to stringify and drop them, so probes only ever
+            # saw prose here. Bounds-safe projection; never fails the call.
+            action_parameters=_scalar_params(
+                tool_input if isinstance(tool_input, dict) else None
+            ),
         )
         if cert.block:
             raise ToolException(
                 f"[Arcezia BLOCK] {cert.summary}\n"
                 f"Trust: {cert.trust_score:.0%} | "
-                f"Fabrication: {cert.fabrication_detected}"
+                # Plain words, not the raw field: it is three-state now, and a
+                # printed "None" reads to a human as a value rather than as
+                # "this server did not say".
+                f"Fabrication: {cert.fabrication_status}"
             )
         if cert.review:
             raise ToolException(
@@ -175,6 +242,9 @@ class ArceziaTool:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
         return cert
 
     def run(self, tool_input: str | dict, **kwargs) -> str:
@@ -199,17 +269,18 @@ class ArceziaTool:
         return f"{result}\n[Arcezia ALLOW | trust={cert.trust_score:.0%}]"
 
     def __getattr__(self, name):
-        # Fail closed: never proxy an execution entry point to the unwrapped
-        # tool. Silently forwarding one (e.g. .batch/._run) would execute the
-        # action with no verification at all.
-        if name in _UNGATED_EXEC_ATTRS:
-            raise AttributeError(
-                f"ArceziaTool does not proxy {name!r} — calling it would bypass "
-                f"verification. Use .run()/.invoke()/.ainvoke(), or "
-                f"ArceziaToolkit.wrap_for_langgraph() for LangGraph and "
-                f"tool-calling graphs."
-            )
-        return getattr(self._tool, name)
+        # Fail closed by default: proxy only what is known inert. Anything else
+        # may be — or may return — an execution path to the unwrapped tool, and
+        # forwarding it would run the action with no verification at all.
+        if name in _PROXY_SAFE_ATTRS:
+            return getattr(self._tool, name)
+        raise AttributeError(
+            f"ArceziaTool does not proxy {name!r} — it is not a known-inert "
+            f"attribute, and forwarding it could execute the tool without "
+            f"verification. Use .run()/.arun()/.invoke()/.ainvoke(), or "
+            f"ArceziaToolkit.wrap_for_langgraph() for LangGraph and "
+            f"tool-calling graphs."
+        )
 
 
 class ArceziaToolkit:
@@ -219,10 +290,14 @@ class ArceziaToolkit:
     credentials directly — ``ArceziaToolkit(api_key="ar_live_...", task=...)``.
     """
 
-    def __init__(self, az=None, *, api_key=None, task=None, api_url=None, capability_envelope=None):
+    def __init__(self, az=None, *, api_key=None, task=None, api_url=None, capability_envelope=None,
+                 data_subject_reference=None):
+        # data_subject_reference: optional identifier for the person these
+        # verifications are about. Record-only — never changes a verdict.
         _require_langchain()
         self._az = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
 
     @property
     def az(self):
@@ -271,6 +346,11 @@ class ArceziaToolkit:
         ]
 
 
+# Bounded projection of typed tool-call args → action_parameters (shared by
+# all integrations; always within the API bounds by construction).
+from ._params import scalar_params as _scalar_params
+
+
 def as_langgraph_tool(tool: "BaseTool", az, domain: str | None = None) -> "BaseTool":
     """
     Wrap a LangChain tool as a *real* BaseTool that verifies before execution.
@@ -292,12 +372,21 @@ def as_langgraph_tool(tool: "BaseTool", az, domain: str | None = None) -> "BaseT
             action_type=tool.name,
             action_description=str(kwargs),
             domain=resolved_domain,
+            # Structured addressing for probe webhooks: the typed tool-call
+            # arguments, NOT model-written prose. Registered probes receive
+            # these as `parameters` and can answer by key lookup. The
+            # projection below is bounds-safe by construction, so it can never
+            # make verify() fail on an otherwise-valid call.
+            action_parameters=_scalar_params(kwargs),
         )
         if cert.block:
             raise ToolException(
                 f"[Arcezia BLOCK] {cert.summary}\n"
                 f"Trust: {cert.trust_score:.0%} | "
-                f"Fabrication: {cert.fabrication_detected}"
+                # Plain words, not the raw field: it is three-state now, and a
+                # printed "None" reads to a human as a value rather than as
+                # "this server did not say".
+                f"Fabrication: {cert.fabrication_status}"
             )
         if cert.review:
             raise ToolException(
@@ -311,6 +400,9 @@ def as_langgraph_tool(tool: "BaseTool", az, domain: str | None = None) -> "BaseT
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
         return tool.invoke(kwargs)
 
     return StructuredTool.from_function(

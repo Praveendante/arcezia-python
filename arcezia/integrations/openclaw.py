@@ -62,8 +62,12 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     guard.az.verify_outcome(action_type="execute_sql",
@@ -87,7 +91,8 @@ import sys
 from typing import Any, Callable, Optional
 
 from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._params import scalar_params
+from arcezia.integrations._common import coerce_az, refuse_unless_clean
 from arcezia.integrations.universal import _infer_domain, _describe
 
 
@@ -125,7 +130,8 @@ class DispatchGuard:
         block_on_review: bool = True,
         evidence_provider: Optional[Callable[[str, dict], dict]] = None,
         review_handler: Optional[Callable[[Any], bool]] = None,
-        on_error: str = "fail_closed",
+        on_error: Optional[str] = None,
+        data_subject_reference: Optional[str] = None,
     ):
         """
         Args:
@@ -140,10 +146,28 @@ class DispatchGuard:
             review_handler:    Callable(cert) → bool. Called on REVIEW instead of
                                raising. Return True to allow; False to block.
                                Typical use: prompt the human ("allow? [y/N]").
-            on_error:          Passed to the Arcezia client. "fail_closed" (default)
-                               → block on unreachable; "review" → surface for human.
+            on_error:          The outage policy for the client this guard BUILDS.
+                               "fail_closed" (the client default) → block on
+                               unreachable; "review" → surface for human;
+                               "fail_open" → proceed unverified. Only meaningful
+                               together with api_key/task — when you pass your
+                               own ``az`` the policy is already that client's,
+                               and passing a different one here raises rather
+                               than being ignored.
+
+                               It WAS ignored: this parameter was accepted and
+                               never forwarded to coerce_az, so a guard built
+                               with on_error="review" fail-closed instead, and a
+                               guard built with on_error="fail_open" raised
+                               during an outage. A safety setting that does
+                               nothing is worse than one that is absent.
+            data_subject_reference: Optional identifier for the person these
+                               verifications are about. Record-only — never
+                               changes a verdict; enables per-person audit lookup.
         """
-        self._client = coerce_az(az, api_key=api_key, task=task, api_url=api_url)
+        self._client = coerce_az(az, api_key=api_key, task=task, api_url=api_url,
+                                 data_subject_reference=data_subject_reference,
+                                 on_error=on_error)
         self._default_domain = domain
         self._block_on_review = block_on_review
         self._evidence_provider = evidence_provider
@@ -217,6 +241,9 @@ class DispatchGuard:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
         import time
         self._active_permissions[f"{domain or self._default_domain or _infer_domain(tool_name)}:{tool_name}"] = time.time()
         if fn is not None:
@@ -254,6 +281,9 @@ class DispatchGuard:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
         import time
         self._active_permissions[f"{domain or self._default_domain or _infer_domain(tool_name)}:{tool_name}"] = time.time()
         if fn is not None:
@@ -277,6 +307,7 @@ class DispatchGuard:
         block_on_review: bool = True,
         evidence_provider: Optional[Callable[[str, dict], dict]] = None,
         review_handler: Optional[Callable[[Any], bool]] = None,
+        data_subject_reference: Optional[str] = None,
     ) -> Callable[[str, dict], Any]:
         """
         Return a gated version of an existing dispatch callable.
@@ -290,6 +321,7 @@ class DispatchGuard:
             az=az, api_key=api_key, task=task, api_url=api_url,
             domain=domain, block_on_review=block_on_review,
             evidence_provider=evidence_provider, review_handler=review_handler,
+            data_subject_reference=data_subject_reference,
         )
 
         if asyncio.iscoroutinefunction(dispatch_fn):
@@ -319,6 +351,8 @@ class DispatchGuard:
             action_description=desc,
             domain=dom,
             agent_evidence=evidence or None,
+            # Typed dispatch args -> probe lookup keys (bounds-safe projection).
+            action_parameters=scalar_params(args),
         )
 
 
@@ -364,6 +398,12 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
         return _cli_decision("block", f"Arcezia BLOCK: {cert.summary}")
     if cert.degraded:
         return _cli_decision("block", f"Arcezia BLOCK (degraded cert — unverified): {cert.summary}")
+    if not cert.is_clean():
+        # T7: same rule as every other surface — an unreported fabrication
+        # check is not a passed one.
+        return _cli_decision(
+            "block",
+            f"Arcezia BLOCK (not cleared: {cert.fabrication_status}): {cert.summary}")
     if cert.review:
         if os.environ.get("ARCEZIA_REVIEW_MODE", "review").lower() == "block":
             return _cli_decision("block", f"Arcezia REVIEW→block (re-request with grounding): {cert.summary}")

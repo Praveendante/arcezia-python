@@ -21,6 +21,19 @@ class _Cert:
     summary: str = "test"
     trust_score: float = 1.0
     credential: dict | None = None
+    # Mirrors ArceziaCertificate: a flag set only by the local fallback
+    # constructor, never inferred. This stub used to compute
+    # `credential is None and trust_score == 0`, which is the inference the
+    # real class removed — it reports every genuine evidence-free BLOCK as an
+    # outage. A test double that disagrees with the class it stands in for is
+    # the same defect as two production paths that disagree.
+    _synthetic: bool = False
+    # Three-state, mirroring ArceziaCertificate after T7: True / False / None,
+    # where None means the server did not report. The default here is False
+    # ("the server looked and found none") because that is what a current
+    # deployment sends; the None case gets its own test below.
+    fabrication_detected: bool | None = False
+    chain_status: str | None = None
 
     @property
     def allow(self): return self.verdict == "ALLOW"
@@ -29,7 +42,19 @@ class _Cert:
     @property
     def review(self): return self.verdict == "REVIEW"
     @property
-    def degraded(self): return self.credential is None and self.trust_score == 0
+    def degraded(self): return self._synthetic
+    @property
+    def semantic_block(self): return self.chain_status == "SEMANTIC_BLOCK"
+    @property
+    def fabrication_status(self):
+        if self.fabrication_detected is True:
+            return "detected"
+        if self.fabrication_detected is False:
+            return "none detected"
+        return "not reported by this server"
+
+    def is_clean(self):
+        return self.fabrication_detected is False and not self.semantic_block
 
 
 class _Verifier:
@@ -124,6 +149,84 @@ class TestFailSafe(unittest.TestCase):
         # verifier=None + no ARCEZIA_API_KEY → ask (never silent-allow)
         os.environ.pop("ARCEZIA_API_KEY", None)
         out = cc.run_hook(json.dumps({"tool_name": "Bash", "tool_input": {"command": "x"}}))
+        self.assertEqual(_perm(out), "ask")
+
+
+class TestDegradedCertIsDenied(unittest.TestCase):
+    """The hook's outage branch, which had no test at all.
+
+    An `on_error` of "review" or "fail_open" makes verify() RETURN a synthetic
+    certificate instead of raising — so the exception handler above it never
+    fires, and the only thing standing between an unverified tool call and
+    execution is the `cert.degraded` check. It is asserted here directly.
+    """
+
+    class _DegradedVerifier:
+        def __init__(self, verdict):
+            self.verdict = verdict
+
+        def verify(self, action_type, action_description, domain):
+            return _Cert(self.verdict, trust_score=0.0, credential=None,
+                         _synthetic=True)
+
+    class _UnreportedVerifier:
+        """A server that ALLOWs without reporting the fabrication check.
+
+        Not a hypothetical shape: it is what any deployment predating the
+        field sends, and what a proxy that drops unknown keys produces.
+        """
+        def verify(self, action_type, action_description, domain):
+            return _Cert("ALLOW", trust_score=1.0,
+                         credential={"token": "arc_cred_test"},
+                         fabrication_detected=None)
+
+    def test_an_allow_whose_fabrication_flag_was_never_reported_is_denied(self):
+        """T7 at the hook. None is the server not having said — and an
+        unreported check is not a passed one, so the gate denies."""
+        out = cc.run_hook(
+            json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            verifier=self._UnreportedVerifier(),
+        )
+        self.assertEqual(_perm(out), "deny")
+
+    def test_a_reported_clean_allow_is_still_allowed(self):
+        """The other half: the change must not deny what the server cleared."""
+        out = cc.run_hook(
+            json.dumps({"tool_name": "Bash", "tool_input": {"command": "ls"}}),
+            verifier=_Verifier("ALLOW"),
+        )
+        self.assertEqual(_perm(out), "allow")
+
+    def test_a_synthetic_allow_is_denied_not_allowed(self):
+        out = cc.run_hook(
+            json.dumps({"tool_name": "Bash",
+                        "tool_input": {"command": "deploy --to production"}}),
+            verifier=self._DegradedVerifier("ALLOW"),
+        )
+        self.assertEqual(_perm(out), "deny")
+
+    def test_a_synthetic_review_is_denied_too(self):
+        out = cc.run_hook(
+            json.dumps({"tool_name": "Bash", "tool_input": {"command": "x"}}),
+            verifier=self._DegradedVerifier("REVIEW"),
+        )
+        self.assertEqual(_perm(out), "deny")
+
+    def test_a_genuine_evidence_free_verdict_is_not_treated_as_an_outage(self):
+        """The inference this stub used to make said otherwise.
+
+        A REVIEW with no credential and trust_score 0 is the normal state of a
+        fresh integration, not an unreachable service. It must reach the human
+        ("ask"), not be denied as a degraded fallback.
+        """
+        class _Real:
+            def verify(self, action_type, action_description, domain):
+                return _Cert("REVIEW", trust_score=0.0, credential=None)
+
+        out = cc.run_hook(
+            json.dumps({"tool_name": "Bash", "tool_input": {"command": "x"}}),
+            verifier=_Real(),
+        )
         self.assertEqual(_perm(out), "ask")
 
 

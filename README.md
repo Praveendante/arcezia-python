@@ -55,6 +55,48 @@ db.execute(sql)  # only reached when the verdict is ALLOW
 The framework adapters below do this for you: a degraded certificate always
 raises `ArceziaUnavailableError` and the tool never executes.
 
+## When Arcezia is unreachable
+
+One setting, `on_error`, decides this — and it applies to **every** method that
+makes a network call, not only `verify()`.
+
+| method | `fail_closed` (default) | `review` | `fail_open` |
+| --- | --- | --- | --- |
+| `verify` | raises `ArceziaUnavailableError` | synthetic REVIEW cert | synthetic ALLOW cert |
+| `verify_chain` | raises | `ArceziaChainResult(overall_verdict="REVIEW_REQUIRED", degraded=True)` | `overall_verdict="SAFE"`, `degraded=True` |
+| `verify_outcome` | raises | synthetic REVIEW result | synthetic ALLOW result |
+| `start_session` | raises | pending, retried on next call | pending, retried on next call |
+| `authorize`, `authorize_production` | raises **and** keeps the token pending | pending, retried | pending, retried |
+| `usage` | raises | raises | raises |
+| `audit_subject` | raises | raises | raises |
+
+Three properties worth quoting in a security review:
+
+1. **Under the default, an outage never becomes an ALLOW.** There is exactly one
+   place in the client that chooses between raising and returning a degraded
+   value, and under `fail_closed` it always raises.
+2. **A degraded verdict is identifiable and carries no credential.**
+   `cert.degraded` — and `result.degraded` on a chain, the same field name on
+   all three result types — is set only by local construction; it is stripped
+   from anything parsed off the wire, so a response cannot claim it and a
+   synthetic ALLOW cannot be replayed as a verified one. Note that a degraded
+   chain result's `overall_verdict` is the string `"SAFE"` under `fail_open`:
+   use `result.safe`, which is False on a degraded result, rather than
+   comparing the string.
+3. **A human approval is never silently dropped.** A failed
+   `POST /v1/authorize` leaves the token pending and re-sends it before the next
+   verdict is asked for; under the default it also raises, so the person who
+   clicked Approve finds out.
+
+A deterministic `4xx` — including a WAF's HTML `403` — is an *answer*, not an
+outage. It raises `ArceziaAPIError` under all three settings, `fail_open`
+included: an edge-blocked deployment fails loudly rather than running every
+tool unverified while looking healthy.
+
+`on_error` belongs to the client. Adapters that take it (`DispatchGuard`) build
+their client with it; passing it alongside an `az` that disagrees raises rather
+than being ignored.
+
 ## Framework integrations
 
 **LangChain / LangGraph**
@@ -167,8 +209,10 @@ different questions:
 |---|---|
 | `cert.missing` | facts **you can act on**. Ground these and re-verify. Legitimately empty when nothing is caller-groundable. |
 | `cert.unresolved` | **every** ungrounded fact, including ones held by a rule rather than directly required. Read this when `missing` is empty but the verdict still is not `ALLOW`. |
-| `cert.denied_authority_axes` | axes you declared `False` in the capability envelope. An action that crosses one **cannot** reach `ALLOW`, and no token lifts it — widening means signing a new envelope. |
+| `cert.denied_authority_axes` | axes you declared `False` in the capability envelope. An action that crosses one **cannot** reach `ALLOW`, and no token lifts it — widening means signing a new envelope. Three-state: a list is what the server reported; `None` means the server did **not** report it, which is never the same as "nothing was denied". Read it with `cert.denied_axes_or_unknown()`, which returns `(axes, reported)`. |
+| `cert.fabrication_detected` | three-state as well: `True` (the server found fabricated evidence), `False` (it looked and found none), `None` (it did not report). `cert.is_clean()` is the fail-closed reading — it is False on `None`, because an absent accusation is not a clearance. `cert.allow` / `.block` / `.review` are unchanged: they gate on `verdict`, which is the decision and is always present. |
 | `cert.semantic_block` | a **cross-step** danger pattern fired for this session — e.g. a sensitive read earlier and an outbound send now. `cert.chain_patterns` names which. |
+| `cert.chain_status` | three-state: `"SEMANTIC_BLOCK"` (the cross-step scan ran and fired), `"CLEAR"` (it ran and found nothing), or `None` (it **did not run** — there was no session to scan across, or it raised). `cert.chain_status_reported` answers "did the scan run"; `cert.is_clean()` does **not** require it, because a sessionless single verify legitimately has no cross-step context. If your deployment always runs sessions and a missing scan should stop the action, write `if not (cert.is_clean() and cert.chain_status_reported): halt()`. |
 
 `denied_authority_axes` is the most common reason a correctly-wired integration
 stays stuck: declaring `"irreversible": False` and then verifying a `DELETE`
@@ -263,27 +307,48 @@ adapter's `.az` property — the same client, no private access.
 ```python
 result = toolkit.az.verify_chain({
     "steps": [
-        {"id": "s1", "action_type": "execute_sql", "domain": "database_ops",
+        {"step_id": "s1", "action_type": "execute_sql", "domain": "database_ops",
          "action_description": "SELECT ssn, name FROM customers"},
-        {"id": "s2", "action_type": "send_email", "domain": "email_ops",
+        {"step_id": "s2", "action_type": "send_email", "domain": "email_ops",
          "action_description": "email the list to external-analytics@gmail.com"},
     ]
 }, stop_on_block=True)
 # → overall_verdict "SEMANTIC_BLOCK", blocked_at "s2",
 #   semantic_triggers [{"pattern_name": "structural_exfiltration", ...}]
 
-# Response: {overall_verdict, blocked_at, steps[], semantic_triggers,
-#            final_state, session_state_updated}
-# There is no top-level "verdict" — per-step verdicts live under steps[].
-if result["overall_verdict"] != "SAFE":
+# An ArceziaChainResult: .overall_verdict, .blocked_at, .steps,
+# .semantic_triggers, .human_summary, .degraded, .safe — plus .raw for
+# anything else the server sent (final_state, session_state_updated).
+# There is no top-level "verdict" — per-step verdicts live under .steps.
+if not result.safe:
     # blocked_at names the step only when execution was actually stopped.
-    # On REVIEW_REQUIRED nothing was blocked, so it is null — find the step
-    # that needs attention in steps[] instead.
-    step = result["blocked_at"] or next(
-        (s["id"] for s in result["steps"] if s["verdict"] != "ALLOW"), None
+    # On REVIEW_REQUIRED nothing was blocked, so it is None — find the step
+    # that needs attention in .steps instead.
+    step = result.blocked_at or next(
+        (s["id"] for s in result.steps if s["verdict"] != "ALLOW"), None
     )
     abort(step)
 ```
+
+The request field is `step_id`; the response's `steps[]` echo it as `id`.
+
+`verify_chain` returned a plain `dict` before 1.0.5. Indexing still works for
+every documented key — `result["overall_verdict"]`, `result["blocked_at"]`,
+`result["steps"]`, `result["summary"]`, `result["final_state"]` — and is
+**deprecated**. Prefer `result.safe` over `result["overall_verdict"] != "SAFE"`:
+the string reads `"SAFE"` on a degraded result too, and `.safe` does not.
+
+**Other behaviour changes in 1.0.5** (the fail-closed direction, deliberately):
+
+- A response that omits `fabrication_detected` now parses as `None` — *not reported*
+  — rather than `False`. `cert.allow` / `cert.block` / `cert.review` are unchanged; they
+  read `verdict`, which is always present. But every framework adapter now gates on
+  `cert.is_clean()`, which treats *not reported* as not clean. No current server omits
+  the field, so no live deployment is affected; a much older self-built server would
+  now be refused at the adapter rather than executed against.
+- Constructing an adapter with a client set to `on_error="fail_open"` emits one warning
+  explaining that the adapter still refuses a degraded (synthetic) certificate. The
+  behaviour is unchanged; the warning exists so the contradiction cannot be hit silently.
 
 `overall_verdict` is one of:
 

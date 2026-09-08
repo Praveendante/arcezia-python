@@ -46,8 +46,12 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
         {"step_id": "s1", "action_type": "execute_sql",
          "domain": "database_ops", "action_description": "SELECT ..."},
     ]})
-    if result["overall_verdict"] != "SAFE":
+    if result["overall_verdict"] != "SAFE":   # dict access: still works, deprecated
         abort(result["blocked_at"])        # the step_id that failed
+    # Current form — `result` is an ArceziaChainResult, and `.safe` is stricter
+    # than the string: it is False on a degraded result, whose overall_verdict
+    # reads "SAFE" under on_error="fail_open".
+    #   if not result.safe: abort(result.blocked_at)
 
     # Post-execution audit
     guard.az.verify_outcome(action_type="execute_sql",
@@ -63,10 +67,13 @@ Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
 """
 from __future__ import annotations
 
+import warnings
+
 from typing import Any, Callable, Optional
 
 from arcezia.client import Arcezia, ArceziaCertificate, ArceziaBlockError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az
+from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._params import scalar_params
 
 
 # Tool name → domain mapping
@@ -109,6 +116,24 @@ _DOMAIN_PATTERNS: dict[str, str] = {
 }
 
 
+_WARNED_DOMAINS: set[str] = set()
+
+
+def _warn_inferred_domain(tool_name: str) -> None:
+    """Warn once per tool that its domain was guessed, not declared."""
+    if tool_name in _WARNED_DOMAINS:
+        return
+    _WARNED_DOMAINS.add(tool_name)
+    warnings.warn(
+        f"Arcezia: no domain declared for tool {tool_name!r} and none could be "
+        f"inferred from its name, so it will be verified against 'agent_action'. "
+        f"If this tool touches a database, the filesystem, or another domain, "
+        f"declare it explicitly — otherwise it is checked against the wrong "
+        f"rules and may be held for review with no obvious reason.",
+        stacklevel=3,
+    )
+
+
 def _infer_domain(tool_name: str) -> str:
     if tool_name in _DOMAIN_MAP:
         return _DOMAIN_MAP[tool_name]
@@ -116,6 +141,9 @@ def _infer_domain(tool_name: str) -> str:
     for kw, domain in _DOMAIN_PATTERNS.items():
         if kw in name_lower:
             return domain
+    # No keyword matched — a fail-safe guess, not a fact. A wrong guess
+    # surfaces later as an unexplainable hold, so say it once, plainly.
+    _warn_inferred_domain(tool_name)
     return "agent_action"
 
 
@@ -154,6 +182,7 @@ class ArceziaAnthropicGuard:
         task: Optional[str] = None,
         api_url: Optional[str] = None,
         capability_envelope: Optional[dict] = None,
+        data_subject_reference: Optional[str] = None,
     ):
         """
         Args:
@@ -162,9 +191,13 @@ class ArceziaAnthropicGuard:
             domain_map:     Optional override for tool_name → domain mapping.
             raise_on_block: If True (default), raise ArceziaBlockError on BLOCK.
                             If False, return blocked items in the blocked list.
+            data_subject_reference: Optional identifier for the person these
+                            verifications are about. Record-only — never
+                            changes a verdict; enables per-person audit lookup.
         """
         self.az = coerce_az(arcezia, api_key=api_key, task=task, api_url=api_url,
-                       capability_envelope=capability_envelope)
+                       capability_envelope=capability_envelope,
+                       data_subject_reference=data_subject_reference)
         self._domain_map = {**_DOMAIN_MAP, **(domain_map or {})}
         self._raise_on_block = raise_on_block
 
@@ -187,6 +220,8 @@ class ArceziaAnthropicGuard:
             action_type=tool_name,
             action_description=description,
             domain=domain,
+            # Typed tool_use input → probe lookup keys (bounds-safe projection).
+            action_parameters=scalar_params(tool_input),
         )
 
         if cert.block and self._raise_on_block:
@@ -198,6 +233,9 @@ class ArceziaAnthropicGuard:
                     "The action was not verified by the engine."
                 )
             )
+        # An ALLOW whose fabrication channel never reported is not a
+        # clearance (T7). One helper, every adapter — see _common.
+        refuse_unless_clean(cert)
 
         return cert
 
@@ -217,24 +255,41 @@ class ArceziaAnthropicGuard:
         blocked = []
 
         for block in content:
-            if not hasattr(block, "type") or block.type != "tool_use":
+            # Read both shapes. Previously a dict-shaped block failed the
+            # hasattr() check and fell into safe_uses UNVERIFIED — a message
+            # that had been JSON round-tripped (logged, queued, replayed) would
+            # have every tool call pass through as "safe". Non-tool blocks
+            # (text, thinking) are still passed through, which is correct;
+            # only tool_use must never skip verification.
+            if isinstance(block, dict):
+                b_type = block.get("type")
+                b_name, b_input = block.get("name"), block.get("input")
+            else:
+                b_type = getattr(block, "type", None)
+                b_name, b_input = getattr(block, "name", None), getattr(block, "input", None)
+            if b_type != "tool_use":
                 safe_uses.append(block)
                 continue
 
-            domain = self._get_domain(block.name)
-            description = _describe_tool_use(block.name, block.input or {})
+            domain = self._get_domain(b_name)
+            description = _describe_tool_use(b_name, b_input or {})
 
             cert = self.az.verify(
-                action_type=block.name,
+                action_type=b_name,
                 action_description=description,
                 domain=domain,
+                # Typed tool_use input → probe lookup keys (bounds-safe projection).
+                action_parameters=scalar_params(b_input or {}),
             )
 
             # Fail-closed: a degraded certificate means the verifier could not be
             # reached (unverified). Treat it as blocked, never safe — matching
             # verify_tool_use / run_tools. Otherwise a network outage would route
             # every tool call into safe_uses and execute it unverified.
-            if cert.allow and not cert.degraded:
+            # `is_clean()` is the T7 half: an ALLOW whose fabrication channel
+            # never reported has not been cleared, so it does not join the safe
+            # list — it joins `blocked`, where the caller already handles it.
+            if cert.allow and not cert.degraded and cert.is_clean():
                 safe_uses.append(block)
             else:
                 blocked.append((block, cert))
@@ -261,23 +316,36 @@ class ArceziaAnthropicGuard:
         """
         results = []
         for block in content:
-            if not hasattr(block, "type") or block.type != "tool_use":
+            # Accept both shapes: SDK content objects (block.type) and plain
+            # dicts (block["type"]). A message that has been JSON round-tripped
+            # — logged, queued, replayed — arrives as dicts, and silently
+            # skipping those would mean the caller's tools never run at all and
+            # they get an empty result list with no error to explain it.
+            if isinstance(block, dict):
+                b_type = block.get("type")
+                b_name, b_input, b_id = block.get("name"), block.get("input"), block.get("id")
+            else:
+                b_type = getattr(block, "type", None)
+                b_name, b_input, b_id = (getattr(block, "name", None),
+                                         getattr(block, "input", None),
+                                         getattr(block, "id", None))
+            if b_type != "tool_use":
                 continue
 
-            cert = self.verify_tool_use(block.name, block.input or {})
+            cert = self.verify_tool_use(b_name, b_input or {})
 
             if cert.allow:
-                tool_result = tool_dispatch(block.name, block.input or {})
+                tool_result = tool_dispatch(b_name, b_input or {})
                 results.append({
-                    "tool_use_id": block.id,
-                    "tool_name": block.name,
+                    "tool_use_id": b_id,
+                    "tool_name": b_name,
                     "result": tool_result,
                     "cert": cert,
                 })
             else:
                 results.append({
-                    "tool_use_id": block.id,
-                    "tool_name": block.name,
+                    "tool_use_id": b_id,
+                    "tool_name": b_name,
                     "result": None,
                     "cert": cert,
                     "blocked": True,

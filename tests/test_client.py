@@ -281,6 +281,31 @@ class TestVerifyFlow(unittest.TestCase):
         self.assertIn("agent_evidence", body)
         self.assertTrue(body["agent_evidence"]["action_within_task_scope"])
 
+    @patch("arcezia.client._post")
+    def test_verify_passes_action_parameters(self, mock_post):
+        """Structured identifiers are forwarded so probe webhooks can answer by
+        key lookup instead of parsing prose out of the description."""
+        mock_post.side_effect = _make_post_side_effect(_allow_resp())
+        az = Arcezia(api_key="ar_test_xxx", task="test")
+        az._session_id = "sess-123"
+        az.verify(
+            action_type="create_invoice",
+            action_description="Create invoice 402 for ACME",
+            action_parameters={"invoice_id": "402", "amount": 129.5},
+        )
+        body = mock_post.call_args[0][2]
+        self.assertEqual(body["action_parameters"],
+                         {"invoice_id": "402", "amount": 129.5})
+
+    @patch("arcezia.client._post")
+    def test_verify_omits_action_parameters_when_absent(self, mock_post):
+        mock_post.side_effect = _make_post_side_effect(_allow_resp())
+        az = Arcezia(api_key="ar_test_xxx", task="test")
+        az._session_id = "sess-123"
+        az.verify(action_type="execute_sql", action_description="SELECT 1")
+        body = mock_post.call_args[0][2]
+        self.assertNotIn("action_parameters", body)
+
 
 # ── Error handling ────────────────────────────────────────────────────────────
 
@@ -313,11 +338,22 @@ class TestErrorHandling(unittest.TestCase):
         self.assertIn("Monthly limit exceeded", str(ctx.exception))
 
     @patch("arcezia.client._post")
-    def test_429_includes_retry_after_for_per_minute_window(self, mock_post):
-        mock_post.return_value = (429, {"detail": {"message": "slow down", "window": "1m"}})
+    def test_429_includes_retry_after_for_the_per_minute_limiter(self, mock_post):
+        mock_post.return_value = (429, {"detail": {"error": "rate_limit_exceeded",
+                                                   "message": "slow down", "window": "1m"}})
         with self.assertRaises(ArceziaRateLimitError) as ctx:
             self._az().verify(action_type="x", action_description="y")
         self.assertEqual(ctx.exception.retry_after, 60)
+
+    @patch("arcezia.client._post")
+    def test_429_has_no_retry_after_when_waiting_cannot_clear_it(self, mock_post):
+        """A monthly quota and a spend ceiling also carry a window. Waiting 60s
+        clears neither, so the SDK must not advertise a wait that does nothing."""
+        for err in ("monthly_limit_exceeded", "spend_ceiling_reached"):
+            mock_post.return_value = (429, {"detail": {"error": err, "message": "x", "window": "30d"}})
+            with self.assertRaises(ArceziaRateLimitError) as ctx:
+                self._az().verify(action_type="x", action_description="y")
+            self.assertIsNone(ctx.exception.retry_after, err)
 
     @patch("arcezia.client._post")
     def test_401_raises_runtime_error_with_invalid_key_message(self, mock_post):
@@ -497,7 +533,7 @@ class TestVerifyChain(unittest.TestCase):
 
     @patch("arcezia.client._post")
     def test_verify_chain_sends_chain_manifest(self, mock_post):
-        def side_effect(url, headers, body):
+        def side_effect(url, headers, body, **kwargs):
             if "/v1/session" in url:
                 return 200, _session_resp()
             return 200, {
@@ -521,7 +557,7 @@ class TestVerifyChain(unittest.TestCase):
 
     @patch("arcezia.client._post")
     def test_verify_chain_includes_session_id(self, mock_post):
-        mock_post.side_effect = lambda url, h, b: (
+        mock_post.side_effect = lambda url, h, b, **kw: (
             (200, _session_resp()) if "/v1/session" in url
             else (200, {"overall_verdict": "SAFE", "blocked_at": None, "steps": [], "final_state": {}, "session_state_updated": False})
         )
