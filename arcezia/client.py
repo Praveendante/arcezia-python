@@ -40,7 +40,7 @@ except ImportError:                                        # pragma: no cover
 
 # Single source of truth for the package version — __init__.__version__ and
 # pyproject.toml must match this (the wheel build reads pyproject).
-_SDK_VERSION = "1.0.4"
+_SDK_VERSION = "1.0.5"
 _USER_AGENT = f"arcezia-python/{_SDK_VERSION}"
 
 
