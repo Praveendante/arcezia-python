@@ -52,6 +52,58 @@ if not cert.allow:
 db.execute(sql)  # only reached when the verdict is ALLOW
 ```
 
+### Reaching ALLOW on a fresh key
+
+Re-run on 2026-09-16 on a free-tier key, a free test key and an enterprise key —
+identical verdicts on all three. A read is held until you say what the engine
+cannot see; a write additionally needs a person's approval.
+
+```python
+az = arcezia.Arcezia(api_key="ar_live_...", task="report on last year's events")
+az.start_session(capability_envelope={          # what this agent may do at most
+    "allowed_domains": ["database_ops"],
+    "allowed_action_types": ["execute_sql"],
+})
+cert = az.verify(action_type="execute_sql", domain="database_ops",
+                 action_description="SELECT COUNT(*) FROM events")
+cert.verdict   # REVIEW — cert.missing starts with the three facts a statement cannot show:
+               # action_direction_is_outbound, action_crosses_trust_boundary, action_involves_sensitive_data
+```
+
+Declare those three for `execute_sql` once, as the account admin (never `"*"`):
+
+```bash
+curl -X POST https://api.arcezia.com/v1/declarations \
+  -H "Authorization: Bearer $ARCEZIA_API_KEY" -H "Content-Type: application/json" \
+  -d '{"declared_absent": {"action_direction_is_outbound": ["execute_sql"],
+                           "action_crosses_trust_boundary": ["execute_sql"],
+                           "action_involves_sensitive_data": ["execute_sql"]}}'
+```
+
+```python
+cert = az.verify(action_type="execute_sql", domain="database_ops",
+                 action_description="SELECT COUNT(*) FROM events")
+cert.verdict     # ALLOW — cert.credential is set
+
+cert = az.verify(action_type="execute_sql", domain="database_ops",
+                 action_description="UPDATE customers SET tier='pro' WHERE id = 42")
+cert.verdict     # REVIEW — a write needs an approval the agent cannot give itself
+                 # (cert.missing names user_explicit_authorization, action_scope_is_mass, ...)
+
+# Declare action_scope_is_mass and action_is_destructive for execute_sql the same
+# way, attach the approval your backend minted, and the same write clears:
+az.authorize(signed_user_token).authorize_production(signed_production_token)
+cert = az.verify(action_type="execute_sql", domain="database_ops",
+                 action_description="UPDATE customers SET tier='pro' WHERE id = 42")
+cert.verdict     # ALLOW
+
+# A declaration never silences what the engine detects: with the same five
+# declarations and the same approvals, "DELETE FROM customers WHERE id = 42"
+# is still held — a destructive statement needs a verified backup your own
+# system confirms — and an agent that claims an approval it does not have is
+# BLOCK with cert.fabrication_detected == True.
+```
+
 The framework adapters below do this for you: a degraded certificate always
 raises `ArceziaUnavailableError` and the tool never executes.
 
@@ -169,10 +221,16 @@ safe_fn = guard_callable(run_sql, az)
 
 **Claude Code CLI hook** (gated at the harness level — every tool call)
 ```bash
-arcezia-hook install      # writes PreToolUse hook to ~/.claude/settings.json
+arcezia-hook install      # merges a PreToolUse hook into ~/.claude/settings.json
 export ARCEZIA_API_KEY=ar_live_...
 export TASK="refactor auth module"
 ```
+`install` never overwrites your settings: a file that does not parse as a JSON
+object raises and names the path, and every write copies the original to
+`settings.json.bak-<timestamp>` first. The hook always exits 0 and always prints
+a decision — a crash denies rather than passing the tool through, because the
+harness reads a non-zero exit as a *non-blocking* error. `WebFetch` and
+`WebSearch` are verified as outbound actions, not treated as reads.
 
 **Generic dispatch-loop agents (OpenCLAW, AutoAgent, …)**
 ```python
@@ -186,6 +244,12 @@ result = guard.dispatch("write_file", {"path": "/etc/app.conf", "content": "..."
 from arcezia.integrations.n8n import workflow_template, save_template
 save_template("arcezia_gate.json")  # import into n8n
 ```
+The template's human-approval path needs two things from you before it enforces
+anything: a signing key registered at `POST /v1/account/token_key`, and an n8n
+HTTP-header credential named "Arcezia Approval Resume Auth" for the Wait node's
+resume URL. The approval token is minted by *your* backend after a person
+approves; the workflow supplies no default for it and stops the run when the
+resume carries none.
 
 ## Verdicts
 
@@ -265,8 +329,19 @@ az.start_session(capability_envelope={
 cert = az.verify(action_type="execute_sql",
                  action_description="SELECT COUNT(*) FROM events",
                  domain="database_ops")
-# → ALLOW, with a signed credential
+# → ALLOW, with a signed credential, once every fact the action depends on is
+#   established. If it comes back REVIEW, cert.missing names what is left.
 ```
+
+Scope and authority are not the only facts an action depends on. Some cannot be
+seen in the action itself — whether a query sends data anywhere, reaches outside
+your organisation, or touches sensitive data. When nothing in the action settles
+one of these, it is left unresolved and the action is held, never assumed safe.
+You settle it by declaring, per action type, which of those risks your
+deployment never has (`POST /v1/declarations`, admin role). Declare a risk
+absent only if it is true of every call of that type —
+a declaration is read as "not present" for everything the engine does not
+detect, and it never overrides something the engine does detect.
 
 Those six axes are the complete set, and the names are exact. The SDK rejects
 an unrecognised axis at `start_session` with a `ValueError` (v1.0.1+), because
@@ -420,6 +495,33 @@ unresolved and the action stays in `REVIEW`.
 > consumers) — the SDK exposes it as `cert.precondition_score`.
 
 Full guide: [arcezia.com/docs](https://arcezia.com/developer-docs)
+
+## Enforcing at the resource
+
+An `ALLOW` carries a single-use credential (`cert.credential`). The strongest
+pattern is an endpoint that refuses work without one: a gate that was skipped
+then has nothing to present, so the action cannot succeed. Placement of a check
+can be forgotten; a missing token cannot be.
+
+Validate it from the resource *before* executing:
+
+```python
+answer = az.validate_credential(cert)          # pass the certificate, not the token
+if not answer["ok"]:
+    refuse(answer["error"])                     # e.g. "action_digest_mismatch"
+```
+
+Passing the certificate is what makes the check strict. It sends
+`cert.action_digest` — the sha256 of the action the verdict was actually about —
+alongside the token, so the answer is "this credential was issued for **this**
+action". With only `action_type`, a credential minted for a single-row `SELECT`
+authorises a table-dropping statement of the same type in the same session.
+
+A refusal comes back as `{"ok": False, "error": …}`; only a transport failure
+raises, and a raise means *not validated* — there is no degraded fallback here.
+Over raw HTTP the same call is `POST /v1/validate_credential` with `token` and
+`action_digest`; the n8n template forwards both as `X-Arcezia-Credential` and
+`X-Arcezia-Action-Digest`.
 
 ## Development mode
 

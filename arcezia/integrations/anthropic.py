@@ -72,7 +72,7 @@ import warnings
 from typing import Any, Callable, Optional
 
 from arcezia.client import Arcezia, ArceziaCertificate, ArceziaBlockError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._common import ACTION_KEYS, coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -148,16 +148,18 @@ def _infer_domain(tool_name: str) -> str:
 
 
 def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
-    """Build a human-readable description of a tool_use block."""
+    """One shared description for every adapter — see ``_common.describe``.
+
+    This used to describe exactly ONE key of the tool input, clipped at 200
+    chars, and the agent then executed the whole block: an email whose `to` was
+    described and whose attachment was a customer DB dump was authorised on the
+    recipient alone (A5-5). The key preference survives as an ORDERING — the
+    fields the structural rules parse lead the string — but every key is now
+    described.
+    """
     if not tool_input:
         return tool_name
-    for key in ("command", "query", "sql", "path", "content", "to", "subject"):
-        if key in tool_input:
-            val = str(tool_input[key])[:200]
-            return f"{tool_name}({key}={val!r})"
-    first_key = next(iter(tool_input))
-    val = str(tool_input[first_key])[:200]
-    return f"{tool_name}({first_key}={val!r})"
+    return describe(tool_name, kwargs=tool_input, priority=ACTION_KEYS)
 
 
 class ArceziaAnthropicGuard:

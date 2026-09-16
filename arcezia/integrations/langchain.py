@@ -205,10 +205,20 @@ class ArceziaTool:
 
     def _gate(self, tool_input) -> "ArceziaCertificate":
         """Verify before execution. Raises on BLOCK / REVIEW / degraded."""
+        # One shared description for every adapter (see _common.describe). This
+        # path never clipped, which was right, but it was also unbounded: an
+        # input past the server's 100 000-char field bound came back a 422
+        # rather than a verdict. describe() keeps every argument and marks any
+        # clip explicitly, so the bound cannot silently become a refusal.
         input_str = (
             tool_input if isinstance(tool_input, str)
+            else _describe(self._tool.name, kwargs=tool_input,
+                           priority=_ACTION_KEYS)
+            if isinstance(tool_input, dict)
             else str(tool_input)
         )
+        if isinstance(input_str, str) and len(input_str) > _DESCRIBE_BUDGET:
+            input_str = _clip_description(input_str, _DESCRIBE_BUDGET)
         cert = self._az.verify(
             action_type=self._tool.name,
             action_description=input_str,
@@ -349,6 +359,10 @@ class ArceziaToolkit:
 # Bounded projection of typed tool-call args → action_parameters (shared by
 # all integrations; always within the API bounds by construction).
 from ._params import scalar_params as _scalar_params
+from ._common import ACTION_KEYS as _ACTION_KEYS
+from ._common import DESCRIBE_BUDGET as _DESCRIBE_BUDGET
+from ._common import _clip as _clip_description
+from ._common import describe as _describe
 
 
 def as_langgraph_tool(tool: "BaseTool", az, domain: str | None = None) -> "BaseTool":
@@ -370,7 +384,8 @@ def as_langgraph_tool(tool: "BaseTool", az, domain: str | None = None) -> "BaseT
     def _verified(**kwargs):
         cert = az.verify(
             action_type=tool.name,
-            action_description=str(kwargs),
+            action_description=_describe(tool.name, kwargs=kwargs,
+                                         priority=_ACTION_KEYS),
             domain=resolved_domain,
             # Structured addressing for probe webhooks: the typed tool-call
             # arguments, NOT model-written prose. Registered probes receive

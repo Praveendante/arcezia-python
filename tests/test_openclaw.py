@@ -186,13 +186,55 @@ class TestCLIHook:
         result = run_cli_hook(json.dumps({"tool": "delete_all_records", "args": {}}), verifier=guard)
         assert result["decision"] == "review"
 
-    def test_malformed_json_returns_review(self):
+    # ── A5-14 ────────────────────────────────────────────────────────────────
+    # These three used to answer "review". "review" is a NON-REFUSAL in a
+    # protocol whose host behaviour this module does not define — it names no
+    # host, so it cannot assume one holds the action — and a missing API key is
+    # not a held action, it is an UNGATED one. The sibling claude_code hook
+    # answers the same three with a decision its host enforces. One question,
+    # one policy: every absence blocks, and the reason says which absence.
+
+    def test_a5_14_malformed_json_blocks(self):
         from arcezia.integrations.openclaw import run_cli_hook
         result = run_cli_hook("not json at all")
-        assert result["decision"] == "review"
+        assert result["decision"] == "block"
+        assert "parse" in result["reason"].lower()
 
-    def test_no_api_key_returns_review(self, monkeypatch):
+    def test_a5_14_no_api_key_blocks(self, monkeypatch):
         monkeypatch.delenv("ARCEZIA_API_KEY", raising=False)
         from arcezia.integrations.openclaw import run_cli_hook
         result = run_cli_hook(json.dumps({"tool": "write_file", "args": {}}))
-        assert result["decision"] == "review"
+        assert result["decision"] == "block"
+        assert "ARCEZIA_API_KEY" in result["reason"]
+
+    def test_a5_14_no_tool_name_blocks(self):
+        from arcezia.integrations.openclaw import run_cli_hook
+        result = run_cli_hook(json.dumps({"args": {"path": "/etc/passwd"}}))
+        assert result["decision"] == "block"
+
+    def test_a5_14_every_absence_blocks_and_review_is_only_a_verdict(self, monkeypatch):
+        """The direction: "review" is reachable only from an engine REVIEW.
+
+        Asserted over a set of malformed payloads rather than the three the
+        audit named, so a new way to be absent cannot quietly become a
+        non-refusal.
+        """
+        monkeypatch.delenv("ARCEZIA_API_KEY", raising=False)
+        from arcezia.integrations.openclaw import run_cli_hook
+        for stdin_text in ("", "   ", "not json", "[]", "null", "{}",
+                           json.dumps({"args": {}}),
+                           json.dumps({"tool": ""}),
+                           json.dumps({"tool": "write_file"})):
+            result = run_cli_hook(stdin_text)
+            assert result["decision"] == "block", f"{stdin_text!r} → {result}"
+            assert result.get("reason")
+
+    def test_a5_14_verifier_construction_failure_blocks(self, monkeypatch):
+        """Building the verifier is part of verifying (the A5-2 shape here)."""
+        import arcezia.integrations.openclaw as oc
+        monkeypatch.setattr(
+            oc, "_default_guard",
+            lambda: (_ for _ in ()).throw(ValueError("bad ARCEZIA_API_URL")))
+        result = oc.run_cli_hook(json.dumps({"tool": "write_file", "args": {}}))
+        assert result["decision"] == "block"
+        assert "bad ARCEZIA_API_URL" in result["reason"]

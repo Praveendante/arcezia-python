@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import functools
 import http.client as _http_client
+import ipaddress as _ipaddress
+import os as _os
 import json
 import os
 import socket as _socket
@@ -40,7 +42,7 @@ except ImportError:                                        # pragma: no cover
 
 # Single source of truth for the package version — __init__.__version__ and
 # pyproject.toml must match this (the wheel build reads pyproject).
-_SDK_VERSION = "1.0.5"
+_SDK_VERSION = "1.0.6"
 _USER_AGENT = f"arcezia-python/{_SDK_VERSION}"
 
 
@@ -494,6 +496,20 @@ class ArceziaCertificate:
     # public key via POST /v1/account/token_key to make signatures mandatory.
     unverified_approvals: list[str] = field(default_factory=list)
 
+    # Operator absence channel state for this verdict (server v35+):
+    # "declared" (the account declared which facts may be read as absent for
+    # this action type), "undeclared" (nothing declared — every probe that saw
+    # nothing stays unresolved, so ordinary actions hold at REVIEW until the
+    # operator declares), or "unavailable" (the declaration store could not be
+    # read; the gate ran at full strength). None: server predates the field.
+    absence_channel: Optional[str] = None
+
+    # False when the capability envelope this verdict used was supplied
+    # unsigned by the caller (the key holder is the principal, so this is the
+    # normal case unless the account requires signed envelopes). None: no
+    # envelope was involved, or the server predates the field.
+    envelope_signed: Optional[bool] = None
+
     # ── Decision identity + provenance (server v31+) ─────────────────────────
     # The stored audit row this decision was written to. Cite log_id to
     # retrieve/verify the record later (GET /v1/audit/record/{log_id}), or
@@ -557,6 +573,27 @@ class ArceziaCertificate:
         fail-safe; it was still a wrong answer to 'did the engine verify this?'
         """
         return self._synthetic
+
+    @property
+    def action_digest(self) -> Optional[str]:
+        """sha256 of the action this verdict is ABOUT, or None.
+
+        Law P — the verdict in ∂≺(E) must be about E. The credential the server
+        mints is bound to this digest (`adg`), so a resource that presents the
+        credential together with the digest gets "this token was issued for THIS
+        action", not merely "for an action of this type in this session".
+        Without it, a credential minted for one `send_email` authorises any
+        other `send_email` in the same session.
+
+        None when the server predates `action_identity` (an honest absence — a
+        digest is never recomputed here, because recomputing it locally would
+        make the check compare the SDK against itself).
+        """
+        ident = self.action_identity
+        if not isinstance(ident, dict):
+            return None
+        digest = ident.get("digest")
+        return digest if isinstance(digest, str) and digest else None
 
     @property
     def evidence_channel_healthy(self) -> bool:
@@ -936,12 +973,37 @@ def _read_text(read: Callable[[], Any], what: str) -> str:
     return raw if isinstance(raw, str) else str(raw)
 
 
+_HTTPX_CLIENT = None
+
+
+def _httpx_client():
+    """A process-wide httpx.Client so connections are kept between calls."""
+    global _HTTPX_CLIENT
+    if _HTTPX_CLIENT is None:
+        _HTTPX_CLIENT = httpx.Client()
+    return _HTTPX_CLIENT
+
+
+# Kept connections on the stdlib transport (default on). ARCEZIA_NO_KEEPALIVE=1
+# restores one connection per call — the escape hatch for a proxy that
+# mishandles persistent connections. The httpx transport keeps its own pool.
+_KEEPALIVE = _os.environ.get("ARCEZIA_NO_KEEPALIVE", "").strip().lower() not in ("1", "true", "yes", "on")
+
+
 def _once_post(url: str, headers: dict, body: dict, timeout: float) -> tuple[int, dict]:
     if _TRANSPORT == "httpx":
-        resp = httpx.post(url, headers=headers, json=body, timeout=timeout)
+        resp = _httpx_client().post(url, headers=headers, json=body, timeout=timeout)
         return resp.status_code, _decode_body(
             resp.status_code, _read_text(lambda: resp.text, "response body"))
     data_bytes = json.dumps(body).encode()
+    if _KEEPALIVE:
+        # One kept connection per host: no TCP + TLS handshake per verdict.
+        # Status handling is uniform — a 4xx/5xx is a status and a body here,
+        # exactly what the urlopen branch below produces via HTTPError.
+        from . import _keepalive
+        status, raw = _keepalive.request(
+            "POST", url, {**headers, "Content-Type": "application/json"}, data_bytes, timeout)
+        return status, _decode_body(status, _read_text(lambda: raw, "response body"))
     req = _urllib_request.Request(
         url, data=data_bytes,
         headers={**headers, "Content-Type": "application/json"},
@@ -957,9 +1019,13 @@ def _once_post(url: str, headers: dict, body: dict, timeout: float) -> tuple[int
 
 def _once_get(url: str, headers: dict, timeout: float) -> tuple[int, dict]:
     if _TRANSPORT == "httpx":
-        resp = httpx.get(url, headers=headers, timeout=timeout)
+        resp = _httpx_client().get(url, headers=headers, timeout=timeout)
         return resp.status_code, _decode_body(
             resp.status_code, _read_text(lambda: resp.text, "response body"))
+    if _KEEPALIVE:
+        from . import _keepalive
+        status, raw = _keepalive.request("GET", url, dict(headers), None, timeout)
+        return status, _decode_body(status, _read_text(lambda: raw, "response body"))
     req = _urllib_request.Request(url, headers=headers, method="GET")
     try:
         with _urllib_request.urlopen(req, timeout=timeout) as resp:
@@ -1024,6 +1090,76 @@ def _raise_for_status(status: int, body: dict) -> None:
         raise ArceziaAuthError(str(body.get("detail", body)))
     if status >= 400:
         raise ArceziaAPIError(status, str(body))
+
+
+# ── SSRF: the verifier's address, decided on the value not the spelling ───────
+
+def _unwrap(addr):
+    """IPv4 hidden inside an IPv6 address, if there is one.
+
+    ``::ffff:127.0.0.1`` is loopback to every network stack and NOT loopback to
+    ``IPv6Address.is_loopback`` — the property is about the v6 address, and the
+    v4 address is a passenger inside it. The same is true of 6to4. Unwrap
+    first, judge second, or the wrapper is a way to spell an address the guard
+    has been told to refuse.
+    """
+    for attr in ("ipv4_mapped", "sixtofour"):
+        inner = getattr(addr, attr, None)
+        if inner is not None:
+            return inner
+    return addr
+
+
+def _is_local_address(addr) -> bool:
+    """True for anything that is not a public internet address."""
+    addr = _unwrap(addr)
+    return bool(
+        addr.is_loopback or addr.is_private or addr.is_link_local
+        or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+    )
+
+
+def _refuse_local_address(host: str, raw_url: str) -> None:
+    """Raise unless ``host`` resolves to public addresses only.
+
+    Law Ω applies to the resolution too: a host that CANNOT be resolved is not
+    a host that resolved to something safe. It is refused, and the message says
+    which of the two it was, because "unreadable" and "clean" must not arrive
+    as the same outcome.
+    """
+    literal = host.strip("[]")
+    try:
+        addresses = [_ipaddress.ip_address(literal)]
+    except ValueError:
+        try:
+            infos = _socket.getaddrinfo(host, None, proto=_socket.IPPROTO_TCP)
+        except OSError as exc:
+            raise ValueError(
+                f"ARCEZIA_API_URL host {host!r} could not be resolved ({exc}), so "
+                f"it cannot be checked against the private address ranges. A "
+                f"verifier whose address is unknown is not a verified address; "
+                f"fix DNS or set ARCEZIA_API_URL to a reachable host."
+            ) from exc
+        addresses = []
+        for info in infos:
+            try:
+                addresses.append(_ipaddress.ip_address(info[4][0].split("%")[0]))
+            except ValueError:
+                continue
+        if not addresses:
+            raise ValueError(
+                f"ARCEZIA_API_URL host {host!r} resolved to no usable address."
+            )
+    for addr in addresses:
+        if _is_local_address(addr):
+            where = "localhost" if _unwrap(addr).is_loopback else "a private or link-local address"
+            raise ValueError(
+                f"ARCEZIA_API_URL cannot point to {where} for live API keys: "
+                f"{host!r} resolves to {addr}. A verification call aimed at an "
+                f"internal service is a verification call that can be answered "
+                f"by the thing being verified. Use ar_test_... keys for local "
+                f"development. (url={raw_url!r})"
+            )
 
 
 # ── Main client ───────────────────────────────────────────────────────────────
@@ -1139,16 +1275,39 @@ class Arcezia:
             raise ValueError(
                 f"ARCEZIA_API_URL must use http or https, got {_parsed.scheme!r}."
             )
-        # In production (live key), refuse localhost/loopback to prevent SSRF
-        # where a compromised config redirects verification calls to an internal
-        # service that always returns ALLOW.
-        _is_live = self._api_key.startswith("ar_live_")
-        _loopback = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-        if _is_live and _parsed.hostname in _loopback:
-            raise ValueError(
-                "ARCEZIA_API_URL cannot point to localhost for live API keys. "
-                "Use ar_test_... keys for local development."
-            )
+        # Anything that is not a declared TEST key is treated as LIVE. It used
+        # to be `startswith("ar_live_")`, so a key of any other shape — a new
+        # prefix, a typo, a truncated value — skipped the guard entirely. The
+        # question the guard asks is "may this deployment aim its verifier at a
+        # local address?", and only an ar_test_ key answers yes.
+        _is_live = not _is_test_key
+        _host = _parsed.hostname
+        if not _host:
+            raise ValueError(f"ARCEZIA_API_URL has no hostname: {raw_url!r}")
+        # In production (live key), refuse localhost/loopback/private/link-local
+        # to prevent SSRF where a compromised config redirects verification
+        # calls to an internal service that always returns ALLOW.
+        #
+        # The refusal is decided on the RESOLVED ADDRESS, not on the spelling.
+        # It used to compare the hostname against four literal strings, so every
+        # other spelling of the same address walked through: 127.0.0.2,
+        # [::ffff:127.0.0.1], 2130706433, 0x7f000001, a DNS name that resolves
+        # to loopback, and 169.254.169.254 (cloud metadata). An address has one
+        # value and unboundedly many spellings; only the value can be checked.
+        if _is_live:
+            _refuse_local_address(_host, raw_url)
+            if _parsed.scheme != "https":
+                # The comment on this guard always said "only https (or http
+                # for test keys)"; the code accepted http for every key, which
+                # put the bearer key on the wire in the clear and let a
+                # compromised config aim verification at a plaintext service
+                # that always answers ALLOW (A5-10). Checked after the address
+                # so the more specific refusal is the one reported.
+                raise ValueError(
+                    "ARCEZIA_API_URL must use https for live API keys, got "
+                    f"{_parsed.scheme!r}. Use an ar_test_... key for local "
+                    "development over http."
+                )
         self._api_url = raw_url
         self._session_id: Optional[str] = None
         self._user_token: Optional[str] = None
@@ -1299,7 +1458,7 @@ class Arcezia:
                 nor otherwise classified holds at REVIEW on unresolved
                 stakes. The declaration can never mask observed escalation: a
                 classified high-stakes type, keyword, or a typed amount at or
-                above the threshold always wins (monotone-up).
+                above the threshold always wins (the stricter reading is kept).
 
         Raises:
             ValueError: if structural_authority contains an unrecognised axis
@@ -1506,6 +1665,103 @@ class Arcezia:
         self._pending_tokens.pop(token_type, None)
 
     # ------------------------------------------------------------------
+    # Credential validation (the resource side of Law P)
+    # ------------------------------------------------------------------
+
+    def validate_credential(
+        self,
+        token,
+        action_type: Optional[str] = None,
+        action_digest: Optional[str] = None,
+        resource_id: Optional[str] = None,
+    ) -> dict:
+        """Validate a single-use credential at the resource, before executing.
+
+        This is the resource-side half of the gate: the tool that is about to
+        act presents the token it was handed and is told whether the token
+        actually authorises THIS action.
+
+        `token` may be the raw ``arc_cred_...`` string or an `ArceziaCertificate`. Pass
+        the certificate and the binding is complete by default — `action_type`
+        and `action_digest` are read off it, so the check answers "was this
+        credential issued for this exact action" rather than "for some action of
+        this type in this session". That default is the point of the helper:
+        `action_digest` has been on the wire since server v31 and stayed opt-in
+        because nothing sent it.
+
+        Passing a raw string keeps the old, weaker question unless you also pass
+        `action_digest` yourself; the response's `action_digest_checked` says
+        which question was answered, so a resource can refuse the weak one.
+
+        Returns the server's answer dict, always carrying ``"ok"``:
+        ``{"ok": True, ...}`` when the credential authorises this action, and
+        ``{"ok": False, "error": "action_digest_mismatch" | "credential_expired"
+        | ...}`` when it does not. The endpoint answers a refusal with HTTP 403
+        and the same dict in `detail`; that is an ANSWER, not a transport
+        failure, so it is returned rather than raised.
+
+        Everything else raises, and a raise must be treated as "not validated":
+        there is no degraded fallback here, because a synthesised ok=True would
+        be exactly the unverified execution the credential exists to prevent.
+        """
+        cert_digest = None
+        cert_type = None
+        if isinstance(token, ArceziaCertificate):
+            cert_digest = token.action_digest
+            cert_type = (token.action_identity or {}).get("type") \
+                if isinstance(token.action_identity, dict) else None
+            raw_token = (token.credential or {}).get("token")
+            if not raw_token:
+                # No credential on this certificate. That is the server
+                # declining to stand behind the verdict, not a validation
+                # question, and it is refused here rather than sent as an
+                # empty token for the server to reject.
+                raise ValueError(
+                    "this certificate carries no credential — the server withholds "
+                    "one exactly when it will not stand behind the ALLOW, so there "
+                    "is nothing to validate and nothing to execute"
+                )
+            token = raw_token
+        if not isinstance(token, str) or not token:
+            raise ValueError("token must be a non-empty credential string or an ArceziaCertificate")
+
+        body: dict = {"token": token}
+        # Explicit arguments win; the certificate fills what was not given.
+        eff_type = action_type if action_type is not None else cert_type
+        eff_digest = action_digest if action_digest is not None else cert_digest
+        if eff_type is not None:
+            body["action_type"] = eff_type
+        if eff_digest is not None:
+            body["action_digest"] = eff_digest
+        if resource_id is not None:
+            body["resource_id"] = resource_id
+
+        status, resp = _post(
+            f"{self._api_url}/v1/validate_credential",
+            self._headers(),
+            body,
+            retries=self._max_retries,
+            timeout=self._timeout,
+        )
+        if status == 403:
+            # The endpoint's refusal shape: the same dict the success path
+            # returns, under `detail`. Handing it back as `ok=False` keeps one
+            # return type for one question.
+            detail = resp.get("detail") if isinstance(resp, dict) else None
+            if isinstance(detail, dict) and "ok" in detail:
+                return detail
+            return {"ok": False, "error": "refused", "detail": detail if detail is not None else resp}
+        if status >= 400:
+            _raise_for_status(status, resp)
+        if not isinstance(resp, dict) or "ok" not in resp:
+            # A 200 with no `ok` in it is not a validation.
+            raise ArceziaTransportError(
+                "POST /v1/validate_credential returned no 'ok' field; "
+                "the credential was NOT validated."
+            )
+        return resp
+
+    # ------------------------------------------------------------------
     # Core verify
     # ------------------------------------------------------------------
 
@@ -1519,9 +1775,19 @@ class Arcezia:
         action_parameters: Optional[dict] = None,
         data_subject_reference: Optional[str] = None,
         data_categories: Optional[list] = None,
+        capability_envelope: Optional[dict] = None,
+        capability_envelope_token: Optional[str] = None,
     ) -> ArceziaCertificate:
         """
         Verify whether an action is safe to execute.
+
+        capability_envelope / capability_envelope_token: present the session's
+        envelope WITH the first action, so opening the session and deciding
+        that action is one round trip. Accepted only before a session exists;
+        the server refuses (409) any envelope on an existing session. The
+        token form is the envelope signed with your registered Ed25519 key
+        (``arcezia.signing.mint_envelope_token``) — the server then records
+        the envelope as signature-verified rather than unverified.
 
         On ALLOW: cert.credential contains a single-use token. Pass it to your
         tool so the tool can validate it at /v1/validate_credential before executing.
@@ -1566,7 +1832,18 @@ class Arcezia:
                 client is not on its own enough to execute an unverified tool.
         """
         def _call() -> ArceziaCertificate:
-            self._ensure_session()
+            _first_action_envelope = bool(
+                (capability_envelope is not None or capability_envelope_token)
+                and not self._session_id
+            )
+            if capability_envelope is not None and capability_envelope_token:
+                raise ValueError("pass capability_envelope or capability_envelope_token, not both")
+            if (capability_envelope is not None or capability_envelope_token) and self._session_id:
+                raise ValueError(
+                    "this client already has a session; an envelope is fixed at session "
+                    "creation — start a new client (or call start_session first)")
+            if not _first_action_envelope:
+                self._ensure_session()
 
             body: dict[str, Any] = {
                 "task": self._task,
@@ -1575,6 +1852,12 @@ class Arcezia:
                 "domain": domain,
                 "session_id": self._session_id,
             }
+            if _first_action_envelope:
+                # One round trip opens the session AND decides the first action.
+                if capability_envelope_token:
+                    body["capability_envelope_token"] = capability_envelope_token
+                else:
+                    body["capability_envelope"] = capability_envelope
             if self._mode and self._mode.lower() in ("development", "dev"):
                 body["mode"] = "development"
             if agent_evidence:
@@ -1594,6 +1877,15 @@ class Arcezia:
                 retries=self._max_retries, timeout=self._timeout,
             )
             _raise_for_status(status, resp)
+            if _first_action_envelope and not self._session_id and resp.get("session_id"):
+                # The session this verdict opened is now this client's session.
+                self._session_id = resp.get("session_id")
+                self._pending_tokens = {
+                    t: v for t, v in (("user", self._user_token),
+                                      ("production", self._prod_token)) if v
+                }
+                if self._pending_tokens:
+                    self._flush_pending_tokens()
             return _parse_cert(resp)
 
         return self._guarded(self._degrade_cert, _call)
@@ -1922,6 +2214,58 @@ class Arcezia:
         return self._guarded(None, _call)
 
     # ------------------------------------------------------------------
+    # Declarations — what silence means for your tools
+    # ------------------------------------------------------------------
+
+    def declarations(self) -> dict:
+        """Read this key's `declared_absent` document and the declarable set.
+
+        Returns the server's `{"declared_absent": {...}, "declarable_constraints":
+        [...], "absence_channel": "declared" | "undeclared" | "unavailable"}`.
+        Raises ArceziaUnavailableError under every on_error setting when the
+        service cannot be reached (nothing is gated here, so there is no safe
+        degraded answer).
+        """
+        def _call() -> dict:
+            status, body = _get(
+                f"{self._api_url}/v1/declarations", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return body
+
+        return self._guarded(None, _call)
+
+    def declare_absent(self, declared_absent: dict) -> dict:
+        """Replace this key's declarations: `{fact_name: [action_type, ...]}`.
+
+        You, not the agent, say which facts a given action type never carries —
+        e.g. that ``execute_sql`` never sends data outbound. A declaration only
+        resolves what the engine could NOT see; anything it detects still
+        stands. Admin role required. Never declare ``"*"``: the service refuses
+        it for a tool's own contract facts and it is a lie for the rest.
+
+        Returns ``{"status": "ok", "declared_absent": {...}}`` as stored.
+        Raises ValueError with the server's reason on a refused document (an
+        unknown fact name, a wildcard where none is accepted).
+        """
+        if not isinstance(declared_absent, dict):
+            raise ValueError("declared_absent must be a dict of {fact_name: [action_type, ...]}")
+
+        def _call() -> dict:
+            status, body = _post(
+                f"{self._api_url}/v1/declarations", self._headers(),
+                {"declared_absent": declared_absent},
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            if status == 400:
+                raise ValueError(str((body or {}).get("detail") or body))
+            _raise_for_status(status, body)
+            return body
+
+        return self._guarded(None, _call)
+
+    # ------------------------------------------------------------------
     # Per-person audit lookup
     # ------------------------------------------------------------------
 
@@ -2048,6 +2392,10 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
         simulation_channel_detail=resp.get("simulation_channel_detail"),
         degraded_defenses=resp.get("degraded_defenses") or [],
         unverified_approvals=resp.get("unverified_approvals") or [],
+        absence_channel=resp.get("absence_channel"),
+        envelope_signed=(resp.get("envelope_signed")
+                         if isinstance(resp.get("envelope_signed"), bool)
+                         else None),
         log_id=resp.get("log_id"),
         created_at=resp.get("created_at"),
         request_id=resp.get("request_id"),

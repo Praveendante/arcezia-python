@@ -92,16 +92,24 @@ from typing import Any, Callable, Optional
 
 from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
 from arcezia.integrations._params import scalar_params
-from arcezia.integrations._common import coerce_az, refuse_unless_clean
-from arcezia.integrations.universal import _infer_domain, _describe
+from arcezia.integrations._common import (
+    ACTION_KEYS as _ACTION_KEYS,
+    coerce_az,
+    describe,
+    refuse_unless_clean,
+)
+from arcezia.integrations.universal import _infer_domain
 
 
 # ── domain inference for generic tool names ────────────────────────────────────
 
 def _dispatch_describe(tool_name: str, args: dict) -> str:
-    """Build a concise, meaningful action description from a tool call."""
-    parts = [f"{k}={repr(v)[:80]}" for k, v in args.items()]
-    return f"{tool_name}({', '.join(parts)})"[:500]
+    """One shared description for every adapter — see ``_common.describe``.
+
+    "Concise" was the defect: 80 chars per value and 500 overall, while
+    ``dispatch`` executed the full arguments (A5-5).
+    """
+    return describe(tool_name, kwargs=args, priority=_ACTION_KEYS)
 
 
 # ── DispatchGuard ──────────────────────────────────────────────────────────────
@@ -327,7 +335,15 @@ class DispatchGuard:
         if asyncio.iscoroutinefunction(dispatch_fn):
             @functools.wraps(dispatch_fn)
             async def _async_gated(tool_name: str, args: dict, **kw):
-                return await guard.adispatch(tool_name, args, fn=lambda **a: dispatch_fn(tool_name, a, **kw), domain=domain)
+                # The forwarder must be a COROUTINE function. It was a plain
+                # lambda returning `dispatch_fn(...)`, so `adispatch` took its
+                # `asyncio.to_thread(fn, ...)` branch and handed back the
+                # un-awaited coroutine object: the upstream dispatch never ran,
+                # and the caller got a coroutine where a result was expected
+                # (A5-16, "coroutine was never awaited").
+                async def _fwd(**a):
+                    return await dispatch_fn(tool_name, a, **kw)
+                return await guard.adispatch(tool_name, args, fn=_fwd, domain=domain)
             return _async_gated
 
         @functools.wraps(dispatch_fn)
@@ -371,22 +387,69 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
 
     Compatible with any CLI agent that supports a pre-dispatch hook (similar to
     Claude Code's PreToolUse hook protocol).
+
+    What a host MUST do with each decision — the contract this function is
+    written against, stated because an unstated one is how "review" came to be
+    returned for three absences (A5-14):
+
+        "block"   the tool MUST NOT run. This is also what every failure and
+                  every absence returns: unparseable input, no tool name, no
+                  API key, a verifier that could not be built, a verification
+                  that raised, a degraded certificate, an unreported
+                  fabrication check.
+        "review"  the tool MUST NOT run until a PERSON approves it. It is
+                  returned only when the engine actually reached a REVIEW
+                  verdict — i.e. it is a verified state, never a fallback. A
+                  host that cannot hold an action for a human must treat
+                  "review" as "block"; set ARCEZIA_REVIEW_MODE=block to have
+                  that decided here instead.
+        "allow"   the engine returned ALLOW, the certificate is not degraded,
+                  and the fabrication channel positively reported clean.
     """
+    # Law Ω: these three are absences, not holds. "review" is a NON-REFUSAL in
+    # a protocol whose host behaviour this module does not define — it names no
+    # host, so it cannot assume one enforces a hold — and the sibling
+    # claude_code hook answers the same three with a decision its host does
+    # enforce. A missing API key is not a held action; it is an UNGATED one
+    # (A5-14). All three block, and the reason says which absence it was.
     try:
         payload = json.loads(stdin_text) if stdin_text.strip() else {}
     except json.JSONDecodeError:
-        return _cli_decision("review", "Arcezia: could not parse tool call; manual review required.")
+        return _cli_decision(
+            "block", "Arcezia BLOCK: could not parse the tool call; nothing was "
+                     "verified, so nothing may run.")
+    if not isinstance(payload, dict):
+        # Valid JSON that is not an object — `[]`, `null`, `"x"`, `3`. It
+        # parsed, so the JSONDecodeError branch above never sees it, and the
+        # `.get` calls below used to raise AttributeError straight out of the
+        # hook: an escaping exception is not a decision, and a host that gets
+        # no decision is a host that was not told to stop.
+        return _cli_decision(
+            "block", "Arcezia BLOCK: the tool call is not a JSON object, so "
+                     "there is no action to verify.")
 
     tool_name = payload.get("tool") or payload.get("tool_name") or payload.get("name") or ""
     args = payload.get("args") or payload.get("tool_input") or payload.get("input") or {}
 
     if not tool_name:
-        return _cli_decision("review", "Arcezia: no tool name in payload; manual review.")
+        return _cli_decision(
+            "block", "Arcezia BLOCK: no tool name in the payload, so there is no "
+                     "action to verify.")
 
     if verifier is None:
-        verifier = _default_guard()
+        try:
+            verifier = _default_guard()
+        except Exception as exc:
+            # Constructing the guard is part of verifying: a bad ARCEZIA_API_URL
+            # or ARCEZIA_ON_ERROR raises here, and an escaping exception is not
+            # a decision (the same defect as A5-2 in the Claude Code hook).
+            return _cli_decision(
+                "block", f"Arcezia BLOCK: could not build the verifier "
+                         f"(fail-closed): {exc}")
         if verifier is None:
-            return _cli_decision("review", "Arcezia not configured (set ARCEZIA_API_KEY); manual review.")
+            return _cli_decision(
+                "block", "Arcezia BLOCK: not configured (set ARCEZIA_API_KEY). "
+                         "An unconfigured gate does not authorise the action.")
 
     try:
         dom = os.environ.get("ARCEZIA_DEFAULT_DOMAIN") or _infer_domain(tool_name)
@@ -408,7 +471,15 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
         if os.environ.get("ARCEZIA_REVIEW_MODE", "review").lower() == "block":
             return _cli_decision("block", f"Arcezia REVIEW→block (re-request with grounding): {cert.summary}")
         return _cli_decision("review", f"Arcezia REVIEW (human approval required): {cert.summary}")
-    return _cli_decision("allow", f"Arcezia ALLOW: {cert.summary}")
+    # Allow is POSITIVE — see the identical note in claude_code.run_hook. A
+    # verdict that matches none of the branches above is not an allow; it is a
+    # response this hook does not understand.
+    if cert.allow:
+        return _cli_decision("allow", f"Arcezia ALLOW: {cert.summary}")
+    return _cli_decision(
+        "block",
+        f"Arcezia BLOCK — no recognised verdict ({cert.verdict!r}) in the "
+        f"response, so nothing authorised this action: {cert.summary}")
 
 
 def _default_guard() -> Optional[DispatchGuard]:

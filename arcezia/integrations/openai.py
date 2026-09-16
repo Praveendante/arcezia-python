@@ -74,11 +74,12 @@ from __future__ import annotations
 
 import warnings
 
+import asyncio
 import functools
 from typing import Any, Callable, ClassVar
 
 from arcezia.client import ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._common import ACTION_KEYS, coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -212,7 +213,14 @@ class ArceziaGuard:
             fn_args = {}
 
         domain = overrides.get(fn_name) or _infer_domain(fn_name)
-        description = f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:200]})"
+        # All arguments, one shared budget, an explicit marker when clipped —
+        # this was `json.dumps(fn_args)[:200]`, so a 200-char benign prefix
+        # authorised whatever followed it (A5-5). See _common.describe.
+        description = describe(
+            fn_name,
+            kwargs=fn_args if isinstance(fn_args, dict) else {"arguments": fn_args},
+            priority=ACTION_KEYS,
+        )
 
         cert = self._az.verify(
             action_type=fn_name,
@@ -283,9 +291,9 @@ class ArceziaGuard:
         """
         effective_domain = domain or _infer_domain(name)
 
-        @functools.wraps(fn)
-        def safe_fn(*args, **kwargs):
-            description = f"{name}(args={args!r}, kwargs={kwargs!r})"[:300]
+        def _gate(args, kwargs):
+            # Was clipped at 300 while the full args were executed (A5-5).
+            description = describe(name, args, kwargs, priority=ACTION_KEYS)
             cert = self._az.verify(
                 action_type=name,
                 action_description=description,
@@ -313,9 +321,38 @@ class ArceziaGuard:
             # An ALLOW whose fabrication channel never reported is not a
             # clearance (T7). One helper, every adapter — see _common.
             refuse_unless_clean(cert)
+            return cert
+
+        # An async `fn` needs an async wrapper. A sync wrapper around a
+        # coroutine function returns the coroutine OBJECT: the caller gets
+        # something that has not run, the verification and the execution stop
+        # being adjacent, and `RuntimeWarning: coroutine was never awaited` is
+        # the only sign. Same shape as A5-16 in openclaw; universal.py already
+        # splits the two, and this path is the sibling that did not.
+        if asyncio.iscoroutinefunction(fn):
+            @functools.wraps(fn)
+            async def safe_afn(*args, **kwargs):
+                # verify() is blocking HTTP; keep it off the event loop.
+                await asyncio.to_thread(_gate, args, kwargs)
+                return await fn(*args, **kwargs)
+
+            return safe_afn
+
+        @functools.wraps(fn)
+        def safe_fn(*args, **kwargs):
+            _gate(args, kwargs)
             return fn(*args, **kwargs)
 
         return safe_fn
+
+
+# The execution entry points of a CrewAI tool. Both are gated, neither is
+# special-cased: `_run` is the sync one, `_arun` the async one CrewAI's BaseTool
+# declares so async tools can override it (and which `arun()` calls). A guard
+# that enumerates one and misses its twin is the defect class this list closes
+# (A5-1); adding a third entry point here is the whole change needed if CrewAI
+# ever grows one.
+_GATED_ENTRY_POINTS = frozenset({"_run", "_arun"})
 
 
 class ArceziaCrewTool:
@@ -339,6 +376,27 @@ class ArceziaCrewTool:
 
             def _run(self, sql: str) -> str:
                 return db.execute(sql)
+
+    Co-inheriting with CrewAI's own BaseTool — the form you need when the tool
+    has to BE a crewai BaseTool — requires the ClassVar annotations, because
+    crewai's BaseTool is a pydantic model and pydantic rejects the SUBCLASS's
+    own un-annotated assignments (`PydanticUserError: A non-annotated
+    attribute was detected: 'az'`). Annotate them and it works:
+
+        from typing import Any, ClassVar
+        from crewai.tools import BaseTool as CrewBaseTool
+
+        class SafeDBTool(ArceziaCrewTool, CrewBaseTool):
+            az: ClassVar[Any] = az
+            domain: ClassVar[str] = "database_ops"
+            name: str = "execute_sql"                # a real pydantic field
+            description: str = "Run SQL against production database"
+
+            def _run(self, sql: str) -> str:
+                return db.execute(sql)
+
+            async def _arun(self, sql: str) -> str:  # gated exactly like _run
+                return await db.aexecute(sql)
     """
     # ClassVar so pydantic never treats these as fields: CrewAI's BaseTool is a
     # pydantic model, and a subclass may co-inherit
@@ -353,7 +411,7 @@ class ArceziaCrewTool:
     domain: ClassVar[str] = "agent_action"
 
     def __init_subclass__(cls, **kwargs):
-        """Gate the subclass's ``_run`` at definition time.
+        """Gate the subclass's ``_run`` AND ``_arun`` at definition time.
 
         The gate must sit on the method that actually executes, not on a
         wrapper the caller may skip. Subclasses implement ``_run``, so any
@@ -361,26 +419,53 @@ class ArceziaCrewTool:
         internally, a test, or user code — would otherwise execute the action
         unverified. Gating at the execution point makes this independent of
         how the caller enters.
+
+        ``_arun`` is the sibling execution entry point, not a variant of the
+        same one: CrewAI's ``BaseTool`` declares it precisely so async tools
+        override it, and ``arun()`` calls it. Enumerating ``_run`` alone left
+        every async CrewAI tool ungated (A5-1). A guard that names one entry
+        point and not its twin is the defect class, so both are wrapped here
+        and neither is special-cased.
+
+        A subclass that defines neither is left alone: CrewAI's
+        ``NotImplementedError`` stays in place.
         """
         super().__init_subclass__(**kwargs)
-        impl = cls.__dict__.get("_run")
-        if impl is None or getattr(impl, "_arcezia_gated", False):
-            return
 
-        @functools.wraps(impl)
-        def _gated_run(self, *args, **kwargs):
-            self._arcezia_gate(args, kwargs)
-            return impl(self, *args, **kwargs)
+        sync_impl = cls.__dict__.get("_run")
+        if sync_impl is not None and not getattr(sync_impl, "_arcezia_gated", False):
+            @functools.wraps(sync_impl)
+            def _gated_run(self, *args, **kwargs):
+                self._arcezia_gate(args, kwargs)
+                return sync_impl(self, *args, **kwargs)
 
-        _gated_run._arcezia_gated = True          # type: ignore[attr-defined]
-        cls._run = _gated_run
+            _gated_run._arcezia_gated = True       # type: ignore[attr-defined]
+            cls._run = _gated_run
+
+        async_impl = cls.__dict__.get("_arun")
+        if async_impl is not None and not getattr(async_impl, "_arcezia_gated", False):
+            @functools.wraps(async_impl)
+            async def _gated_arun(self, *args, **kwargs):
+                # verify() is blocking HTTP; run it off the event loop so a
+                # gated async tool does not stall the whole loop.
+                await asyncio.to_thread(self._arcezia_gate, args, kwargs)
+                return await async_impl(self, *args, **kwargs)
+
+            _gated_arun._arcezia_gated = True      # type: ignore[attr-defined]
+            cls._arun = _gated_arun
 
     def _arcezia_gate(self, args: tuple, kwargs: dict) -> None:
         """Verify before execution. Raises on BLOCK / REVIEW / degraded."""
-        first = args[0] if args else next(iter(kwargs.values()), "")
+        # Every argument, not just the first. It described `str(args[0])[:300]`
+        # and nothing else, so a CrewAI tool called as
+        # `run(table="users", where="1=1; DELETE FROM users")` was verified on
+        # the string 'users' and then executed the delete (A5-5).
         cert = self.az.verify(
             action_type=getattr(self, "name", "unnamed_tool"),
-            action_description=str(first)[:300],
+            action_description=describe(
+                getattr(self, "name", "unnamed_tool"), args, kwargs,
+                priority=ACTION_KEYS,
+            ),
             domain=self.domain,
             # Typed keyword arguments → probe lookup keys (bounds-safe).
             action_parameters=scalar_params(kwargs),
@@ -410,10 +495,71 @@ class ArceziaCrewTool:
         # clearance (T7). One helper, every adapter — see _common.
         refuse_unless_clean(cert)
 
+    def __getattribute__(self, name):
+        """Gate ``_run`` / ``_arun`` at ACCESS time, not at definition time.
+
+        ``__init_subclass__`` can only see a ``_run`` present in the class
+        body. A ``_run`` assigned afterwards — ``Late._run = fn``, a
+        monkeypatch, an instance attribute, a mixin applied later — carried no
+        gate and executed unverified (A5-18). Definition time is the wrong
+        instant to decide this: the only instant at which the executing
+        callable is known is the instant it is fetched. So every fetch of an
+        execution entry point returns something gated, however the callable
+        arrived and whoever fetches it — ``run()``, CrewAI's own machinery, a
+        test, or user code reaching for ``tool._run`` directly.
+
+        Idempotent: a callable already carrying ``_arcezia_gated`` is returned
+        as-is, so a class-body ``_run`` wrapped by ``__init_subclass__`` is
+        never verified twice. The base stubs below are left alone so a tool
+        that implements neither still raises CrewAI's ``NotImplementedError``
+        without a verification round trip first.
+        """
+        attr = super().__getattribute__(name)
+        if name not in _GATED_ENTRY_POINTS:
+            return attr
+        if not callable(attr):
+            return attr
+        if getattr(attr, "_arcezia_gated", False) or getattr(attr, "_arcezia_stub", False):
+            return attr
+
+        if name == "_arun":
+            @functools.wraps(attr)
+            async def _gated(*args, **kwargs):
+                # verify() is blocking HTTP; keep it off the event loop.
+                await asyncio.to_thread(self._arcezia_gate, args, kwargs)
+                return await attr(*args, **kwargs)
+        else:
+            @functools.wraps(attr)
+            def _gated(*args, **kwargs):
+                self._arcezia_gate(args, kwargs)
+                return attr(*args, **kwargs)
+
+        _gated._arcezia_gated = True               # type: ignore[attr-defined]
+        return _gated
+
     def run(self, *args, **kwargs) -> str:
-        # The gate lives on _run (installed by __init_subclass__), so it holds
-        # whether the caller enters through run() or _run().
+        # The gate lives on _run — installed by __init_subclass__ for a
+        # class-body implementation, and by __getattribute__ for every other
+        # way one can arrive — so it holds whether the caller enters through
+        # run() or _run(), and it fires exactly once.
         return self._run(*args, **kwargs)
+
+    async def arun(self, *args, **kwargs) -> str:
+        # Async twin of run(): CrewAI's BaseTool.arun() calls _arun, which is
+        # gated by the same rule. Enumerating the sync entry point and missing
+        # its async sibling is what left every async CrewAI tool ungated.
+        return await self._arun(*args, **kwargs)
 
     def _run(self, *args, **kwargs) -> str:
         raise NotImplementedError("Subclass must implement _run()")
+
+    async def _arun(self, *args, **kwargs) -> str:
+        raise NotImplementedError(
+            "Subclass must implement _arun() for async execution "
+            "(or call run() / _run() for the sync path)."
+        )
+
+    # Not gated: refusing to execute is already the safe outcome, and wrapping
+    # these would spend a verification on a call that cannot run.
+    _run._arcezia_stub = True                      # type: ignore[attr-defined]
+    _arun._arcezia_stub = True                     # type: ignore[attr-defined]

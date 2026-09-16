@@ -94,7 +94,7 @@ import functools
 from typing import Any, Callable, Coroutine
 
 from arcezia.client import Arcezia, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._common import coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -153,9 +153,12 @@ def _infer_domain(name: str) -> str:
 
 
 def _describe_call(name: str, args: tuple, kwargs: dict) -> str:
-    parts = [repr(a)[:80] for a in args]
-    parts += [f"{k}={v!r}"[:80] for k, v in kwargs.items()]
-    return f"{name}({', '.join(parts)[:300]})"
+    """One shared description for every adapter — see ``_common.describe``.
+
+    Was 80 chars per argument and 300 overall, while the wrapper went on to
+    execute the full arguments (A5-5).
+    """
+    return describe(name, args, kwargs)
 
 
 class ArceziaAutoGenGuard:

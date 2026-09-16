@@ -31,8 +31,13 @@ Typical pattern (inside n8n workflow):
          "BLOCK"  → route to error / stop node
          "REVIEW" → route to Wait node (pause for human signal)
     3. Human approval (REVIEW path):
-         → Approval HTTP Request node: POST /v1/authorize with signed token
-         → Continue after approval
+         → Wait node, resumed over an AUTHENTICATED webhook (header-auth
+           credential, random n8n-generated id) carrying `approval_token`
+         → Approval HTTP Request node: POST /v1/authorize with that token
+         The token is minted by YOUR backend after a person approves and is
+         signed with the key you registered at POST /v1/account/token_key.
+         The workflow never supplies a default for it — see
+         `workflow_template()` for why that default was a self-approval.
     4. Action node (Write file, HTTP Request, etc.)
 
 This module provides:
@@ -174,6 +179,33 @@ def workflow_template(
 
     Wire your upstream trigger → "Build Verify Body" input.
     Replace "Action Placeholder" with your real action node.
+
+    ── The approval token is YOURS to mint; this workflow cannot mint it ──────
+    The REVIEW path pauses at "Wait for Human Approval" and resumes only when
+    something POSTs to its resume URL with an `approval_token`. That token must
+    be a signed JWT issued by YOUR backend, AFTER a person has approved, and
+    signed with the private half of the Ed25519 key you registered at
+    POST /v1/account/token_key. The whole point of the user-signal channel is
+    that it carries a fact the agent cannot produce; a value the workflow can
+    write for itself is not that fact.
+
+    Two operator steps before this template enforces anything:
+
+      1. Register your signing key (POST /v1/account/token_key). Until you do,
+         /v1/authorize accepts an unverified token on PRESENCE alone and says
+         so in its response (`verification: "unverified"`) — the weakness is
+         reported, not hidden, but it is still a weakness.
+      2. Create the n8n credential "Arcezia Approval Resume Auth" (HTTP Header
+         Auth) and give the secret only to the backend that mints approvals.
+         The Wait node's resume URL is authenticated with it. Do not publish
+         that URL; n8n generates a random id for it per workflow, and this
+         template deliberately does not fix one.
+
+    Earlier versions of this template sent
+    `{{ $json.approval_token || 'n8n-human-approved' }}`. Resuming with an empty
+    body therefore authorised the run with a constant string baked into a public
+    template — the workflow grading its own approval. That default is gone, and
+    "Approval Token Present?" stops the run when the resume carries no token.
     """
     template = {
         # n8n's CLI importer (`n8n import:workflow`) writes straight to the
@@ -320,16 +352,79 @@ def workflow_template(
                 "id": "node-route"
             },
             {
+                # The resume URL is an AUTHORISATION channel, so it is
+                # authenticated like one. Two things changed here:
+                #   • no `webhookId` / `webhookSuffix`. A fixed suffix made the
+                #     resume URL guessable from the template alone — the same
+                #     path on every deployment that imported it — so anyone who
+                #     had read the template could resume any paused run.
+                #     Leaving both out makes n8n mint a random id per workflow.
+                #   • `authentication` is header auth against an operator
+                #     credential. n8n spells this key `authentication` on the
+                #     current Wait node and `incomingAuthentication` on older
+                #     1.x builds; both are written so the template does not
+                #     silently resume unauthenticated on either. An unknown
+                #     parameter is ignored by n8n; an absent one defaults to
+                #     "none", which is the failure.
                 "parameters": {
                     "resume": "webhook",
-                    "webhookSuffix": "arcezia-approval"
+                    "httpMethod": "POST",
+                    "authentication": "headerAuth",
+                    "incomingAuthentication": "headerAuth",
+                    "options": {}
                 },
                 "name": "Wait for Human Approval",
                 "type": "n8n-nodes-base.wait",
-                "typeVersion": 1,
+                "typeVersion": 1.1,
                 "position": [1050, 450],
                 "id": "node-wait",
-                "webhookId": "arcezia-approval-webhook"
+                "credentials": {
+                    "httpHeaderAuth": {
+                        "id": "arcezia-approval-auth",
+                        "name": "Arcezia Approval Resume Auth"
+                    }
+                }
+            },
+            {
+                # An approval that arrived with no token is not an approval.
+                # The template used to send `$json.approval_token ||
+                # 'n8n-human-approved'`, so the workflow minted its own
+                # approval: resuming the Wait node with an empty body produced
+                # a constant string that /v1/authorize accepted as a user
+                # signal. The workflow was grading its own approval.
+                #
+                # There is no default any more, and this IF node is what makes
+                # the absence loud rather than an empty body parameter the
+                # server may or may not reject.
+                "parameters": {
+                    "conditions": {
+                        "options": {"caseSensitive": True, "version": 2},
+                        "combinator": "and",
+                        "conditions": [
+                            {
+                                "leftValue": "={{ $json.body ? $json.body.approval_token : $json.approval_token }}",
+                                "rightValue": "",
+                                "operator": {"type": "string", "operation": "notEmpty", "singleValue": True}
+                            }
+                        ]
+                    },
+                    "options": {}
+                },
+                "name": "Approval Token Present?",
+                "type": "n8n-nodes-base.if",
+                "typeVersion": 2,
+                "position": [1150, 450],
+                "id": "node-approval-present"
+            },
+            {
+                "parameters": {
+                    "errorMessage": "=Arcezia: the approval resume carried no approval_token, so nothing authorised this run. The token must be minted by your backend AFTER a person approves — the workflow cannot mint its own."
+                },
+                "name": "Approval Missing - Stop Run",
+                "type": "n8n-nodes-base.stopAndError",
+                "typeVersion": 1,
+                "position": [1350, 560],
+                "id": "node-approval-missing-stop"
             },
             {
                 "parameters": {
@@ -342,7 +437,9 @@ def workflow_template(
                         "parameters": [
                             {"name": "session_id",  "value": "={{ $('Start Session').item.json.session_id }}"},
                             {"name": "token_type",  "value": "user"},
-                            {"name": "token",       "value": "={{ $json.approval_token || 'n8n-human-approved' }}"}
+                            # No fallback. The value is whatever the resume
+                            # carried, and nothing else.
+                            {"name": "token",       "value": "={{ $json.body ? $json.body.approval_token : $json.approval_token }}"}
                         ]
                     },
                     "options": {}
@@ -350,7 +447,7 @@ def workflow_template(
                 "name": "Authorize (Human Approved)",
                 "type": "n8n-nodes-base.httpRequest",
                 "typeVersion": 4,
-                "position": [1250, 450],
+                "position": [1450, 450],
                 "id": "node-authorize",
                 "credentials": {"httpHeaderAuth": {"id": "arcezia-key", "name": "Arcezia API Key"}}
             },
@@ -380,7 +477,16 @@ def workflow_template(
                             # .token, not the whole object — the response returns
                             # {token, expires_at, action_type}, and interpolating
                             # the object into a header sends "[object Object]".
-                            {"name": "X-Arcezia-Credential", "value": "={{ $('Arcezia Verify').item.json.credential.token }}"}
+                            {"name": "X-Arcezia-Credential", "value": "={{ $('Arcezia Verify').item.json.credential.token }}"},
+                            # Law P — the credential travels with the digest of
+                            # the action it was issued for. Your endpoint sends
+                            # both to POST /v1/validate_credential as `token`
+                            # and `action_digest`; with the digest the answer is
+                            # "this token authorises THIS action", without it
+                            # only "an action of this type in this session", so
+                            # a token minted for a harmless call of the same
+                            # type would be accepted for a destructive one.
+                            {"name": "X-Arcezia-Action-Digest", "value": "={{ $('Arcezia Verify').item.json.action_identity.digest }}"}
                         ]
                     },
                     "sendBody": True,
@@ -445,7 +551,13 @@ def workflow_template(
                     [{"node": "Blocked - Stop Run", "type": "main", "index": 0}]        # anything else
                 ]
             },
-            "Wait for Human Approval": {"main": [[{"node": "Authorize (Human Approved)", "type": "main", "index": 0}]]},
+            "Wait for Human Approval": {"main": [[{"node": "Approval Token Present?", "type": "main", "index": 0}]]},
+            "Approval Token Present?": {
+                "main": [
+                    [{"node": "Authorize (Human Approved)", "type": "main", "index": 0}],   # true  — a token arrived
+                    [{"node": "Approval Missing - Stop Run", "type": "main", "index": 0}]   # false — nothing approved
+                ]
+            },
             "Authorize (Human Approved)": {"main": [[{"node": "Arcezia Verify", "type": "main", "index": 0}]]},
             "Action (Replace Me)": {"main": [[{"node": "Verify Outcome", "type": "main", "index": 0}]]}
         },

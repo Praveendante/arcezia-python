@@ -27,7 +27,7 @@ _CLIENT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # Client methods whose documented calls we validate.
 _CHECKED = ("verify", "verify_chain", "verify_outcome", "authorize",
-            "start_session", "verify_outcome")
+            "start_session", "verify_outcome", "validate_credential")
 
 
 def _adapter_methods() -> dict[str, list]:

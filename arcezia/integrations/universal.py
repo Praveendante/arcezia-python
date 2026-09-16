@@ -43,7 +43,7 @@ import functools
 from typing import Any, Callable, Optional
 
 from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, refuse_unless_clean
+from arcezia.integrations._common import coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -90,9 +90,13 @@ def _infer_domain(name: str) -> str:
 
 
 def _describe(action_type: str, args: tuple, kwargs: dict) -> str:
-    parts = [repr(a)[:80] for a in args]
-    parts += [f"{k}={v!r}"[:80] for k, v in kwargs.items()]
-    return f"{action_type}({', '.join(parts)})"[:500]
+    """One shared description for every adapter — see ``_common.describe``.
+
+    This used to clip each argument at 80 characters and the whole string at
+    500, then execute the FULL arguments: a single-argument call was authorised
+    on its first 80 characters, mid-string, with no closing quote (A5-5).
+    """
+    return describe(action_type, args, kwargs)
 
 
 def guard_callable(
