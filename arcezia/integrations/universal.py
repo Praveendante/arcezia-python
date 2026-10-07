@@ -43,7 +43,7 @@ import functools
 from typing import Any, Callable, Optional
 
 from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, describe, refuse_unless_clean
+from arcezia.integrations._common import call_of, coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -90,12 +90,7 @@ def _infer_domain(name: str) -> str:
 
 
 def _describe(action_type: str, args: tuple, kwargs: dict) -> str:
-    """One shared description for every adapter — see ``_common.describe``.
-
-    This used to clip each argument at 80 characters and the whole string at
-    500, then execute the FULL arguments: a single-argument call was authorised
-    on its first 80 characters, mid-string, with no closing quote (A5-5).
-    """
+    """One shared description for every adapter — see ``_common.describe``."""
     return describe(action_type, args, kwargs)
 
 
@@ -119,10 +114,11 @@ def guard_callable(
     Pass an existing client as ``az`` or inline ``api_key=``/``task=``. Works on
     both sync and async callables; the returned wrapper matches the original.
 
-    capability_envelope: Human-signed scope authorization (structural_authority,
-        allowed_domains, max_scope). Injected into the session on creation.
-    evidence_provider: Optional callable(action_type, args, kwargs) → dict.
-        Returns agent_evidence for llm_inferred constraints.
+    capability_envelope: What the session may do (allowed_domains, max_scope,
+        ...), set by a person. Applied to the session when it is created.
+    evidence_provider: Optional callable(action_type, args, kwargs) → dict,
+        sent as agent_evidence: what the agent says. It can never clear an
+        action on its own.
     data_subject_reference: Optional identifier for the person this tool's
         actions are about, attached to every verification the wrapper makes.
         Record-only — never changes a verdict.
@@ -138,7 +134,7 @@ def guard_callable(
             try:
                 ev = evidence_provider(atype, args, kwargs)
             except Exception:
-                pass  # evidence provider failure = Ω, never a block
+                pass  # a failing evidence provider sends nothing; it never clears anything
         # Per-call subject kwarg only when set: keeps the call compatible with
         # user-supplied clients whose verify() predates the parameter.
         _subject_kw = (
@@ -150,7 +146,7 @@ def guard_callable(
             action_description=_describe(atype, args, kwargs),
             domain=dom,
             agent_evidence=ev,
-            # Typed keyword arguments -> probe lookup keys (bounds-safe).
+            # Typed keyword arguments, forwarded to your registered checks.
             action_parameters=scalar_params(kwargs),
             **_subject_kw,
         )
@@ -158,10 +154,9 @@ def guard_callable(
             raise ArceziaBlockError(cert)
         if cert.review and block_on_review:
             raise ArceziaReviewError(cert)
-        # A degraded certificate (credential=None, trust_score=0) was not
-        # verified by the engine. It is a synthetic fallback, not a verified
-        # result. The only safe default is to raise, forcing the caller to
-        # handle the degraded state explicitly.
+        # A degraded certificate (credential=None, trust_score=0) was built
+        # locally because the service could not be reached. Nothing was
+        # verified, so raise and let the caller decide.
         if cert.degraded:
             raise ArceziaUnavailableError(
                 RuntimeError(
@@ -169,20 +164,12 @@ def guard_callable(
                     "The action was not verified by the engine."
                 )
             )
-        # The fail-closed reading of the auxiliary flags (T7). `cert.allow`
-        # gates on `verdict`, which is the decision and is always present; that
-        # is left exactly as it was. This is the second question: did the
-        # evidence behind that decision actually get REPORTED? A response that
-        # omits `fabrication_detected` used to parse as "no fabrication" — an
-        # absence read as a clearance. It now parses as None, and one shared
-        # helper, called at every adapter's refusal point, turns that unknown
-        # into a refusal, so nothing executes on a verdict whose fabrication
-        # channel never spoke.
-        #
-        # Reached only on an ALLOW that is neither blocked, held, nor degraded,
-        # so on any server that reports the flag (every current deployment)
-        # it makes no difference at all.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming THIS call
+        # (recomputed from the arguments that will execute). One helper,
+        # every adapter — see _common.
+        refuse_unless_clean(cert, call_of(atype, dom, _describe(atype, args, kwargs),
+                                          scalar_params(kwargs)))
         return cert
 
     if asyncio.iscoroutinefunction(fn):

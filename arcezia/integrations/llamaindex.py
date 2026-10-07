@@ -48,7 +48,7 @@ reached through ``toolkit.az`` — the same Arcezia client, no private access:
                           outcome={"rows_affected": 50000},
                           expected={"rows_affected": 1})
 
-    # Level 3 — ground human intent (a model cannot forge this)
+    # Level 3 — attach a person's approval (a model cannot produce this)
     toolkit.az.authorize(token=user_approval_token)
 
 Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
@@ -140,7 +140,7 @@ class ArceziaLlamaToolkit:
 
             .az.verify_chain(manifest)     # Level 2 — verify a whole plan
             .az.verify_outcome(...)        # post-execution audit
-            .az.authorize(token)           # Level 3 — ground human intent
+            .az.authorize(token)           # Level 3 — attach a person's approval
         """
         return self._az
 

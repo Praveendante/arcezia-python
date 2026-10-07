@@ -106,10 +106,8 @@ def build_verify_body(
     if agent_evidence:
         body["agent_evidence"] = agent_evidence
     if action_parameters:
-        # Structured addressing (P2): the typed tool-call arguments (record
-        # ids, paths, amounts) — forwarded to probe webhooks AND read by the
-        # engine's own probes (e.g. a numeric amount escalates
-        # action_is_high_stakes in a way prose rewording cannot evade).
+        # The typed tool-call arguments (record ids, paths, amounts),
+        # forwarded to your checks.
         body["action_parameters"] = action_parameters
     if data_subject_reference is not None:
         # Record-only: names the person the action is about so the decision
@@ -134,13 +132,12 @@ const body = {{
   action_description: $input.item.json.description || JSON.stringify($input.item.json),
   domain:             $input.item.json.domain || "{domain}",
   session_id:         $('Start Session').item.json.session_id || undefined,
-  // agent_evidence: CLAIMED quality only. For GROUNDED evidence, register
-  // a probe webhook via the Arcezia admin API (POST /v1/probes).
+  // agent_evidence: what the agent says. It can never clear an action on
+  // its own. Connect a check (POST /v1/probes) so your system answers instead.
   agent_evidence:     $input.item.json.evidence || undefined,
   // action_parameters: the TYPED tool-call arguments (record ids, paths,
-  // amounts). Flat scalar map, max 32 keys. Probe webhooks receive it as
-  // `parameters`; the engine's own probes read it too (a numeric amount
-  // escalates stakes in a way prose rewording cannot evade).
+  // amounts). Flat scalar map, max 32 keys. Typed arguments are forwarded to
+  // your checks, which receive them as `parameters`.
   action_parameters:  $input.item.json.parameters || undefined,
   // data_subject_reference: who this action is about (your customer id).
   // Record-only — never changes the verdict; lets you look up every decision
@@ -185,9 +182,9 @@ def workflow_template(
     something POSTs to its resume URL with an `approval_token`. That token must
     be a signed JWT issued by YOUR backend, AFTER a person has approved, and
     signed with the private half of the Ed25519 key you registered at
-    POST /v1/account/token_key. The whole point of the user-signal channel is
-    that it carries a fact the agent cannot produce; a value the workflow can
-    write for itself is not that fact.
+    POST /v1/account/token_key. An approval is only worth something because
+    the agent cannot produce it; a value the workflow can write for itself is
+    not an approval.
 
     Two operator steps before this template enforces anything:
 
@@ -243,8 +240,7 @@ def workflow_template(
                         "// Each step may be individually legal while the SEQUENCE is not;\n"
                         "// /v1/verify_chain is what catches that.\n"
                         "// NOTE: `domain` goes on EVERY STEP, not on the manifest.\n"
-                        "// The engine reads step['domain']; a step without one raises\n"
-                        "// inside the runner and comes back as an opaque HTTP 500.\n"
+                        "// A step without one is not verified and the call fails.\n"
                         f"const DOMAIN = '{domain}';\n"
                         "const steps = ($json.steps || [\n"
                         "// The key is `action_description`. A step carrying a bare\n"
@@ -390,8 +386,8 @@ def workflow_template(
                 # The template used to send `$json.approval_token ||
                 # 'n8n-human-approved'`, so the workflow minted its own
                 # approval: resuming the Wait node with an empty body produced
-                # a constant string that /v1/authorize accepted as a user
-                # signal. The workflow was grading its own approval.
+                # a constant string that /v1/authorize accepted as a person's
+                # approval. The workflow was grading its own approval.
                 #
                 # There is no default any more, and this IF node is what makes
                 # the absence loud rather than an empty body parameter the
@@ -478,7 +474,7 @@ def workflow_template(
                             # {token, expires_at, action_type}, and interpolating
                             # the object into a header sends "[object Object]".
                             {"name": "X-Arcezia-Credential", "value": "={{ $('Arcezia Verify').item.json.credential.token }}"},
-                            # Law P — the credential travels with the digest of
+                            # The credential travels with the digest of
                             # the action it was issued for. Your endpoint sends
                             # both to POST /v1/validate_credential as `token`
                             # and `action_digest`; with the digest the answer is

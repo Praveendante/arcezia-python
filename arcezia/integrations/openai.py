@@ -64,7 +64,7 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
                           outcome={"rows_affected": 50000},
                           expected={"rows_affected": 1})
 
-    # Level 3 — ground human intent (a model cannot forge this)
+    # Level 3 — attach a person's approval (a model cannot produce this)
     guard.az.authorize(token=user_approval_token)
 
 Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
@@ -78,8 +78,8 @@ import asyncio
 import functools
 from typing import Any, Callable, ClassVar
 
-from arcezia.client import ArceziaUnavailableError
-from arcezia.integrations._common import ACTION_KEYS, coerce_az, describe, refuse_unless_clean
+from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavailableError
+from arcezia.integrations._common import ACTION_KEYS, call_of, coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -169,7 +169,7 @@ class ArceziaGuard:
 
             .az.verify_chain(manifest)     # Level 2 — verify a whole plan
             .az.verify_outcome(...)        # post-execution audit
-            .az.authorize(token)           # Level 3 — ground human intent
+            .az.authorize(token)           # Level 3 — attach a person's approval
         """
         return self._az
 
@@ -213,9 +213,8 @@ class ArceziaGuard:
             fn_args = {}
 
         domain = overrides.get(fn_name) or _infer_domain(fn_name)
-        # All arguments, one shared budget, an explicit marker when clipped —
-        # this was `json.dumps(fn_args)[:200]`, so a 200-char benign prefix
-        # authorised whatever followed it (A5-5). See _common.describe.
+        # All arguments, one shared budget, an explicit marker when clipped.
+        # See _common.describe.
         description = describe(
             fn_name,
             kwargs=fn_args if isinstance(fn_args, dict) else {"arguments": fn_args},
@@ -226,7 +225,7 @@ class ArceziaGuard:
             action_type=fn_name,
             action_description=description,
             domain=domain,
-            # Typed function-call arguments → probe lookup keys (bounds-safe).
+            # Typed function-call arguments, forwarded to your registered checks.
             action_parameters=scalar_params(fn_args if isinstance(fn_args, dict) else None),
         )
 
@@ -246,7 +245,7 @@ class ArceziaGuard:
                 "result": None,
                 "error": (
                     f"[Arcezia REVIEW] {cert.summary} | "
-                    f"Missing: {', '.join(cert.missing)}"
+                    f"To proceed: {', '.join(cert.release)}"
                 ),
                 "cert": cert,
                 "blocked": True,
@@ -259,9 +258,16 @@ class ArceziaGuard:
                     "The action was not verified by the engine."
                 )
             )
-        # An ALLOW whose fabrication channel never reported is not a
-        # clearance (T7). One helper, every adapter — see _common.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming the call about to
+        # run (recomputed from the parsed arguments). One helper, every
+        # adapter — see _common.
+        refuse_unless_clean(cert, call_of(
+            fn_name, domain,
+            describe(fn_name,
+                     kwargs=fn_args if isinstance(fn_args, dict) else {"arguments": fn_args},
+                     priority=ACTION_KEYS),
+            scalar_params(fn_args if isinstance(fn_args, dict) else None)))
 
         fn = tool_implementations.get(fn_name)
         if fn is None:
@@ -287,29 +293,31 @@ class ArceziaGuard:
         Return a wrapped version of fn that runs Arcezia before executing.
 
         safe_execute = guard.wrap_function("execute_sql", db.execute, domain="database_ops")
-        safe_execute(sql="DROP TABLE users")   # raises RuntimeError if blocked
+        safe_execute(sql="DROP TABLE users")   # raises ArceziaBlockError (a RuntimeError)
         """
         effective_domain = domain or _infer_domain(name)
 
         def _gate(args, kwargs):
-            # Was clipped at 300 while the full args were executed (A5-5).
+            # Was clipped at 300 while the full args were executed.
             description = describe(name, args, kwargs, priority=ACTION_KEYS)
             cert = self._az.verify(
                 action_type=name,
                 action_description=description,
                 domain=effective_domain,
-                # Typed keyword arguments → probe lookup keys (bounds-safe).
+                # Typed keyword arguments, forwarded to your registered checks.
                 action_parameters=scalar_params(kwargs),
             )
             if cert.block:
-                raise RuntimeError(
+                raise ArceziaBlockError(
+                    cert,
                     f"[Arcezia BLOCK] {cert.summary}"
-                    + _fabrication_note(cert)
+                    + _fabrication_note(cert),
                 )
             if cert.review:
-                raise RuntimeError(
+                raise ArceziaReviewError(
+                    cert,
                     f"[Arcezia REVIEW] {cert.summary} | "
-                    f"Missing: {', '.join(cert.missing)}"
+                    f"To proceed: {', '.join(cert.release)}",
                 )
             if cert.degraded:
                 raise ArceziaUnavailableError(
@@ -318,17 +326,20 @@ class ArceziaGuard:
                         "The action was not verified by the engine."
                     )
                 )
-            # An ALLOW whose fabrication channel never reported is not a
-            # clearance (T7). One helper, every adapter — see _common.
-            refuse_unless_clean(cert)
+            # An ALLOW whose fabrication result was never reported is not a
+            # clearance, and an ALLOW runs only on a pass naming the call about
+            # to run. One helper, every adapter — see _common.
+            refuse_unless_clean(cert, call_of(
+                name, effective_domain,
+                describe(name, args, kwargs, priority=ACTION_KEYS),
+                scalar_params(kwargs)))
             return cert
 
         # An async `fn` needs an async wrapper. A sync wrapper around a
         # coroutine function returns the coroutine OBJECT: the caller gets
         # something that has not run, the verification and the execution stop
         # being adjacent, and `RuntimeWarning: coroutine was never awaited` is
-        # the only sign. Same shape as A5-16 in openclaw; universal.py already
-        # splits the two, and this path is the sibling that did not.
+        # the only sign.
         if asyncio.iscoroutinefunction(fn):
             @functools.wraps(fn)
             async def safe_afn(*args, **kwargs):
@@ -348,10 +359,8 @@ class ArceziaGuard:
 
 # The execution entry points of a CrewAI tool. Both are gated, neither is
 # special-cased: `_run` is the sync one, `_arun` the async one CrewAI's BaseTool
-# declares so async tools can override it (and which `arun()` calls). A guard
-# that enumerates one and misses its twin is the defect class this list closes
-# (A5-1); adding a third entry point here is the whole change needed if CrewAI
-# ever grows one.
+# declares so async tools can override it (and which `arun()` calls). Adding a
+# third entry point here is the whole change needed if CrewAI ever grows one.
 _GATED_ENTRY_POINTS = frozenset({"_run", "_arun"})
 
 
@@ -422,10 +431,8 @@ class ArceziaCrewTool:
 
         ``_arun`` is the sibling execution entry point, not a variant of the
         same one: CrewAI's ``BaseTool`` declares it precisely so async tools
-        override it, and ``arun()`` calls it. Enumerating ``_run`` alone left
-        every async CrewAI tool ungated (A5-1). A guard that names one entry
-        point and not its twin is the defect class, so both are wrapped here
-        and neither is special-cased.
+        override it, and ``arun()`` calls it. Both are wrapped here and
+        neither is special-cased.
 
         A subclass that defines neither is left alone: CrewAI's
         ``NotImplementedError`` stays in place.
@@ -456,10 +463,7 @@ class ArceziaCrewTool:
 
     def _arcezia_gate(self, args: tuple, kwargs: dict) -> None:
         """Verify before execution. Raises on BLOCK / REVIEW / degraded."""
-        # Every argument, not just the first. It described `str(args[0])[:300]`
-        # and nothing else, so a CrewAI tool called as
-        # `run(table="users", where="1=1; DELETE FROM users")` was verified on
-        # the string 'users' and then executed the delete (A5-5).
+        # Every argument, not just the first, so what is verified is what runs.
         cert = self.az.verify(
             action_type=getattr(self, "name", "unnamed_tool"),
             action_description=describe(
@@ -467,22 +471,23 @@ class ArceziaCrewTool:
                 priority=ACTION_KEYS,
             ),
             domain=self.domain,
-            # Typed keyword arguments → probe lookup keys (bounds-safe).
+            # Typed keyword arguments, forwarded to your registered checks.
             action_parameters=scalar_params(kwargs),
         )
         # Raise — never return a string. Returning "[BLOCKED]..." hands the
         # block message to the LLM which may rephrase and retry. An exception
         # propagates to the CrewAI task runner as a hard failure.
         if cert.block:
-            raise RuntimeError(
-                f"[Arcezia BLOCK] {cert.summary} | "
-                f"trust={cert.trust_score:.0%}"
-                + _fabrication_note(cert)
+            raise ArceziaBlockError(
+                cert,
+                f"[Arcezia BLOCK] {cert.summary}"
+                + _fabrication_note(cert),
             )
         if cert.review:
-            raise RuntimeError(
+            raise ArceziaReviewError(
+                cert,
                 f"[Arcezia REVIEW] Human confirmation required: {cert.summary} | "
-                f"Missing: {', '.join(cert.missing)}"
+                f"To proceed: {', '.join(cert.release)}",
             )
         if cert.degraded:
             raise ArceziaUnavailableError(
@@ -491,9 +496,13 @@ class ArceziaCrewTool:
                     "The action was not verified by the engine."
                 )
             )
-        # An ALLOW whose fabrication channel never reported is not a
-        # clearance (T7). One helper, every adapter — see _common.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming the call about to
+        # run. One helper, every adapter — see _common.
+        _name = getattr(self, "name", "unnamed_tool")
+        refuse_unless_clean(cert, call_of(
+            _name, self.domain, describe(_name, args, kwargs, priority=ACTION_KEYS),
+            scalar_params(kwargs)))
 
     def __getattribute__(self, name):
         """Gate ``_run`` / ``_arun`` at ACCESS time, not at definition time.
@@ -501,7 +510,7 @@ class ArceziaCrewTool:
         ``__init_subclass__`` can only see a ``_run`` present in the class
         body. A ``_run`` assigned afterwards — ``Late._run = fn``, a
         monkeypatch, an instance attribute, a mixin applied later — carried no
-        gate and executed unverified (A5-18). Definition time is the wrong
+        gate and executed unverified. Definition time is the wrong
         instant to decide this: the only instant at which the executing
         callable is known is the instant it is fetched. So every fetch of an
         execution entry point returns something gated, however the callable

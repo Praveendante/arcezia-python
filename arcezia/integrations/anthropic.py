@@ -59,7 +59,7 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
                           outcome={"rows_affected": 50000},
                           expected={"rows_affected": 1})
 
-    # Level 3 — ground human intent (a model cannot forge this)
+    # Level 3 — attach a person's approval (a model cannot produce this)
     guard.az.authorize(token=user_approval_token)
 
 Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
@@ -72,7 +72,9 @@ import warnings
 from typing import Any, Callable, Optional
 
 from arcezia.client import Arcezia, ArceziaCertificate, ArceziaBlockError, ArceziaUnavailableError
-from arcezia.integrations._common import ACTION_KEYS, coerce_az, describe, refuse_unless_clean
+from arcezia.integrations._common import (
+    ACTION_KEYS, call_of, coerce_az, describe, pass_hold_reason, refuse_unless_clean,
+)
 from arcezia.integrations._params import scalar_params
 
 
@@ -150,12 +152,8 @@ def _infer_domain(tool_name: str) -> str:
 def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     """One shared description for every adapter — see ``_common.describe``.
 
-    This used to describe exactly ONE key of the tool input, clipped at 200
-    chars, and the agent then executed the whole block: an email whose `to` was
-    described and whose attachment was a customer DB dump was authorised on the
-    recipient alone (A5-5). The key preference survives as an ORDERING — the
-    fields the structural rules parse lead the string — but every key is now
-    described.
+    Every key of the tool input is described, so what is verified is what
+    runs. Keys that usually carry the action come first.
     """
     if not tool_input:
         return tool_name
@@ -222,7 +220,7 @@ class ArceziaAnthropicGuard:
             action_type=tool_name,
             action_description=description,
             domain=domain,
-            # Typed tool_use input → probe lookup keys (bounds-safe projection).
+            # Typed tool_use input, forwarded to your registered checks.
             action_parameters=scalar_params(tool_input),
         )
 
@@ -235,9 +233,12 @@ class ArceziaAnthropicGuard:
                     "The action was not verified by the engine."
                 )
             )
-        # An ALLOW whose fabrication channel never reported is not a
-        # clearance (T7). One helper, every adapter — see _common.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming this tool_use
+        # (recomputed from its input). One helper, every adapter — see _common.
+        refuse_unless_clean(cert, call_of(
+            tool_name, domain, _describe_tool_use(tool_name, tool_input),
+            scalar_params(tool_input)))
 
         return cert
 
@@ -258,7 +259,7 @@ class ArceziaAnthropicGuard:
 
         for block in content:
             # Read both shapes. Previously a dict-shaped block failed the
-            # hasattr() check and fell into safe_uses UNVERIFIED — a message
+            # hasattr() check and fell into safe_uses unverified — a message
             # that had been JSON round-tripped (logged, queued, replayed) would
             # have every tool call pass through as "safe". Non-tool blocks
             # (text, thinking) are still passed through, which is correct;
@@ -280,7 +281,7 @@ class ArceziaAnthropicGuard:
                 action_type=b_name,
                 action_description=description,
                 domain=domain,
-                # Typed tool_use input → probe lookup keys (bounds-safe projection).
+                # Typed tool_use input, forwarded to your registered checks.
                 action_parameters=scalar_params(b_input or {}),
             )
 
@@ -288,10 +289,16 @@ class ArceziaAnthropicGuard:
             # reached (unverified). Treat it as blocked, never safe — matching
             # verify_tool_use / run_tools. Otherwise a network outage would route
             # every tool call into safe_uses and execute it unverified.
-            # `is_clean()` is the T7 half: an ALLOW whose fabrication channel
+            # `is_clean()`: an ALLOW whose fabrication channel
             # never reported has not been cleared, so it does not join the safe
             # list — it joins `blocked`, where the caller already handles it.
-            if cert.allow and not cert.degraded and cert.is_clean():
+            # And the pass rule every adapter applies (see _common): an
+            # ALLOW joins `safe_uses` only on a pass naming this tool_use, or
+            # with no pass because there was no session.
+            if (cert.allow and not cert.degraded and cert.is_clean()
+                    and pass_hold_reason(cert, call_of(
+                        b_name, domain, _describe_tool_use(b_name, b_input or {}),
+                        scalar_params(b_input or {}))) is None):
                 safe_uses.append(block)
             else:
                 blocked.append((block, cert))

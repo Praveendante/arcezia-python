@@ -2,11 +2,8 @@
 
 ``urllib.request.urlopen`` opens a new TCP + TLS connection for every call.
 For a verdict that is the whole cost: from a client far from the API the
-handshake is two round trips before the request is even sent, roughly 300 ms,
-against about 40 ms of work on the server. Re-establishing a connection to
-the same host is re-making a distinction already made ("this peer is
-Arcezia, this channel is private"), and its forced cost is zero: make it
-once and keep the channel.
+handshake is two round trips before the request is even sent. Reuse one
+connection per host instead.
 
 One ``http.client`` connection per (scheme, host, port), guarded by a lock so
 the SDK stays safe to call from threads. A request that fails on a connection

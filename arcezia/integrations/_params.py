@@ -1,25 +1,20 @@
 """
-Shared projection of typed tool-call arguments onto the bounded scalar map the
-API accepts as ``action_parameters``.
+Typed tool-call arguments, reduced to the bounded map the API accepts as
+``action_parameters``.
 
-Why this exists: registered probe webhooks receive ``parameters`` so they can
-answer a constraint by KEY LOOKUP into the customer's own records instead of
-parsing identifiers out of the free-text description. The correct source for
-those keys is the framework's TYPED tool-call arguments — not model-written
-prose. Every integration that has the parsed arguments in hand forwards them
-through this projection.
+Your registered checks receive these as ``parameters``, so they can look an
+argument up in your own records instead of reading it out of the description.
 
-Safety property (load-bearing): the projection is ALWAYS within the API bounds
-(max 32 entries, keys <=64 chars, scalar values only, strings <=512 chars), so
-forwarding parameters can never turn a working tool call into a validation
-error. Non-scalar values are dropped — parameters are lookup keys, not
-payloads — and non-finite floats are dropped because they do not survive JSON.
+The result always fits the API's limits (at most 32 entries, keys up to 64
+characters, scalar values only, strings up to 512 characters), so forwarding
+arguments never turns a working tool call into a validation error. Non-scalar
+values and non-finite floats are dropped.
 """
 from __future__ import annotations
 
 import math
 
-# Kept in sync with the server-side model bounds (VerifyRequest.action_parameters).
+# The API's limits for action_parameters.
 MAX_PARAMS = 32
 MAX_KEY_CHARS = 64
 MAX_VALUE_CHARS = 512
@@ -42,5 +37,5 @@ def scalar_params(kwargs: dict | None) -> dict | None:
             out[key] = v
         elif isinstance(v, str):
             out[key] = v[:MAX_VALUE_CHARS]
-        # dicts/lists/objects are dropped: parameters are lookup keys, not payloads
+        # dicts/lists/objects are dropped: only scalar values are forwarded
     return out or None

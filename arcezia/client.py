@@ -42,7 +42,7 @@ except ImportError:                                        # pragma: no cover
 
 # Single source of truth for the package version — __init__.__version__ and
 # pyproject.toml must match this (the wheel build reads pyproject).
-_SDK_VERSION = "1.0.6"
+_SDK_VERSION = "1.0.7"
 _USER_AGENT = f"arcezia-python/{_SDK_VERSION}"
 
 
@@ -54,10 +54,18 @@ def _backoff(attempt: int) -> float:
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
 class ArceziaBlockError(RuntimeError):
-    """Raised by @az.gate() when an action is blocked."""
-    def __init__(self, cert: "ArceziaCertificate"):
+    """Raised by @az.gate() and by every framework adapter when an action is
+    blocked.
+
+    ``err.cert`` is the full certificate: read ``err.cert.summary`` for why it
+    was refused and ``err.cert.missing`` / ``err.cert.violated`` for what to fix.
+    It subclasses ``RuntimeError``, so an existing ``except RuntimeError``
+    still catches it. ``message`` overrides the text only; the certificate is
+    always attached.
+    """
+    def __init__(self, cert: "ArceziaCertificate", message: Optional[str] = None):
         self.cert = cert
-        super().__init__(str(cert))
+        super().__init__(message if message is not None else str(cert))
 
 
 class ArceziaReviewError(RuntimeError):
@@ -66,10 +74,15 @@ class ArceziaReviewError(RuntimeError):
     the guard is configured to halt on review (the default). REVIEW means the
     action is not yet authorized to execute — surfacing it as an exception
     prevents a tool from running before a human approves.
+
+    ``err.cert`` is the full certificate: ``err.cert.missing`` names what would
+    release the hold. It subclasses ``RuntimeError``, so an existing
+    ``except RuntimeError`` still catches it. ``message`` overrides the text
+    only; the certificate is always attached.
     """
-    def __init__(self, cert: "ArceziaCertificate"):
+    def __init__(self, cert: "ArceziaCertificate", message: Optional[str] = None):
         self.cert = cert
-        super().__init__(str(cert))
+        super().__init__(message if message is not None else str(cert))
 
 
 class ArceziaUpgradeRequired(RuntimeError):
@@ -148,25 +161,98 @@ _NET_ERRORS: tuple = (
 ) + ((httpx.TransportError,) if httpx is not None else ())
 
 
+# ── Release / reason vocabulary ───────────────────────────────────────────────
+
+_EFFECT_WORDS = {
+    "outbound": "sending data out",
+    "trust_boundary_crossing": "contacting an outside system",
+    "sensitive_data": "sensitive data",
+    "mass_scope": "acting on many records at once",
+    "persistent_mutation": "a lasting change",
+    "irreversible": "a permanent action",
+}
+
+
+def release_sentence(item: str) -> str:
+    """One plain sentence for a release item (what lets a held call proceed)."""
+    kind, _, arg = str(item).partition(":")
+    if kind == "approval":
+        if arg == "production":
+            return "Attach a signed production approval."
+        if arg and arg != "user":
+            # a contract's `approval:<role>` (2026-10-02): mint_token(..., role=arg, action=<binding>)
+            return f"Attach a signed approval from a person in the role '{arg}', bound to this action."
+        return "Attach a signed approval from a person."
+    if item == "check:payment_destination_change_confirmed":
+        return ("The payee's bank details were changed in this session (earlier, or by this call): have your check "
+                "'payment_destination_change_confirmed' confirm the change through a channel the "
+                "requester does not control (for example a call-back to a number already on file).")
+    if item == "check:__fields__":
+        return "Have your fields check ('__fields__') answer the fields your contract reads for this call."
+    if kind == "check":
+        return f"Have your check '{arg}' answer."
+    if item == "contract:tool_effects":
+        return "State in your contract what this tool or command does."
+    if item == "scope:workspace_roots":
+        return "Grant the agent its workspace folder (a signed workspace)."
+    if item == "scope:resource_scope":
+        return ("Sign the tables, records, addresses or folders this job acts on into the session's "
+                "signed capability envelope ('resource_scope').")
+    if kind == "contract":
+        return f"Settle '{arg}' in your contract."
+    if kind == "scope":
+        return f"Cover this action in your capability envelope ('{arg}')."
+    if kind == "declare":
+        return ("State in your contract that this tool never involves "
+                f"{_EFFECT_WORDS.get(arg, arg.replace('_', ' '))}.")
+    return "A person on your team approves it."
+
+
+def reason_sentence(item: str) -> str:
+    """One plain sentence for a reason item (why a call was refused)."""
+    kind, _, arg = str(item).partition(":")
+    words = _EFFECT_WORDS.get(arg, arg.replace("_", " "))
+    if item == "fabrication":
+        return "The agent claimed something that is not true."
+    if kind == "ceiling":
+        return f"Your envelope forbids {words}, and this action involves it."
+    if kind == "scope":
+        return f"It is outside your capability envelope ('{arg}')."
+    if kind == "contract":
+        return f"Your own rule '{arg}' refuses it."
+    if kind == "safety" and arg:
+        return f"A built-in safety rule on {words} refuses it."
+    if kind == "regulation":
+        law, _, art = arg.partition(".art_")
+        law = law.replace("_", " ").upper()
+        return f"A rule enforcing Article {art} of {law} refuses it."
+    return "A built-in safety rule refuses it."
+
+
+_DEPRECATION_WARNED: set = set()
+
+
+def _deprecated_once(old: str, new: str) -> None:
+    if old in _DEPRECATION_WARNED:
+        return
+    _DEPRECATION_WARNED.add(old)
+    import warnings as _w
+    _w.warn(f"ArceziaCertificate.{old} is deprecated; use .{new}.",
+            DeprecationWarning, stacklevel=3)
+
+
 # ── Result types ──────────────────────────────────────────────────────────────
 
 @dataclass
 class ArceziaConstraintDetail:
     name: str
     value: Optional[bool]
-    quality: str    # GROUNDED | INFERRED | CLAIMED | UNVERIFIED | UNRESOLVED | FABRICATED
-    # UNVERIFIED = an approval token accepted on presence alone (the account
-    # has no registered signing key). The fact still counts for the verdict,
-    # but nothing proved a human produced the token — register a key via
-    # POST /v1/account/token_key to upgrade these to GROUNDED.
+    quality: str    # where this answer came from, as the service labels it
+    # An approval accepted without a signature is labelled as unverified:
+    # register a signing key (register_token_key) so approvals are checked.
     detail: str
-    # Plain-words provenance for the same fact `quality` states as an enum —
-    # what a person filing this certificate reads ("a probe measured it",
-    # "the agent asserted it"). The server has emitted it on every constraint
-    # since the plain-language pass; the typed surface dropped it on parse, so
-    # a field the API published was invisible to every SDK user. `quality`
-    # stays the machine field; this is additive and defaults to "" against a
-    # server that predates it.
+    # The same, in plain words ("your system answered", "the agent said so").
+    # Defaults to "" against a server that does not send it.
     quality_plain: str = ""
 
 
@@ -224,7 +310,7 @@ class ArceziaChainResult:
     """
     The return value of az.verify_chain() — a typed result, not a bare dict.
 
-    Why it exists (T8): the "was this made up locally?" marker had three
+    Why it exists: the "was this made up locally?" marker had three
     spellings across this SDK's surface — ``ArceziaCertificate._synthetic``,
     ``ArceziaOutcomeResult._synthetic``, and the string key ``"_synthetic"`` in
     the chain result's dict. One property, three surfaces, and the dict was the
@@ -245,7 +331,7 @@ class ArceziaChainResult:
 
     Every documented key resolves: ``overall_verdict``, ``blocked_at``,
     ``steps``, ``semantic_triggers``, ``summary``, ``_synthetic``, plus
-    anything else the server sent (``final_state``, ``session_state_updated``,
+    anything else the server sent (``release``, ``reason``,
     …) which is read straight from the response. Two rules are kept exactly as
     the dict had them, because tests and callers depend on them:
 
@@ -369,12 +455,14 @@ class ArceziaCertificate:
     """
     verdict: str                           # "ALLOW" | "BLOCK" | "REVIEW"
     status: str                            # "ALLOWED" | "BLOCKED" | "INSUFFICIENT_EVIDENCE"
-    precondition_score: float              # [0,1] severity-weighted fraction of
-                                           # required preconditions satisfied
-    trust_score: float                     # [0,1] fraction of evidence that is
-                                           # externally grounded, not agent-claimed
+    # Deprecated, always None from a current service (no score is reported).
+    # Kept so code that constructs or reads these does not break.
+    precondition_score: Optional[float]
+    trust_score: Optional[float]
     summary: str
+    # On a BLOCK: the reasons (same items as `reason`). On a REVIEW: empty.
     violated: list[str]
+    # On a REVIEW: what would let the call proceed (same items as `release`).
     missing: list[str]
 
     # THREE-STATE, not two. True = the server detected fabricated evidence.
@@ -383,9 +471,7 @@ class ArceziaCertificate:
     # way here. None is an absence, never a clearance.
     #
     # This used to default to False on parse, so a response that omitted the
-    # field read as "no fabrication" — absence converted into a permissive
-    # fact, the defect class this SDK has already closed at five probe sites
-    # and in the outage policy. The verdict-level gates (`allow`/`block`/
+    # field read as "no fabrication". The verdict-level gates (`allow`/`block`/
     # `review`) are unchanged, because `verdict` is the decision and is always
     # present: a server that detects fabrication returns BLOCK in `verdict`
     # too. Use `is_clean()` when you need the flag itself to have positively
@@ -412,9 +498,8 @@ class ArceziaCertificate:
     # `denied_axes_or_unknown()`, which returns a tuple and a flag together.
     denied_authority_axes: Optional[list[str]] = None
 
-    # Every constraint still ungrounded, including those held by a rule rather
-    # than directly required. `missing` lists only what the caller can act on, so
-    # it can legitimately be empty while this is not.
+    # Everything still unanswered for this action. `missing` lists only what
+    # you can act on, so it can legitimately be empty while this is not.
     unresolved: list[str] = field(default_factory=list)
 
     # Cross-step danger detected across this session, e.g. a sensitive read
@@ -440,30 +525,29 @@ class ArceziaCertificate:
     # Note what absence still conflates, because the client cannot separate it
     # either: "no session, so there was nothing to scan across" (expected, and
     # the reason `is_clean()` does not refuse on it) and "the scan raised"
-    # (a lost report). A caller who needs the distinction should require
+    # (a lost report). A caller who needs to tell them apart should require
     # `chain_status_reported` explicitly — see `is_clean()`.
     chain_status: Optional[str] = None
 
-    # Which cross-step patterns fired, e.g. ["structural_exfiltration"].
+    # Which cross-step findings were reported (names as the service gives them).
     chain_patterns: list[str] = field(default_factory=list)
 
-    # ── Evidence-channel observability (server v30+) ─────────────────────────
-    # Which probe-backed facts were consulted for THIS verdict, and how each
-    # resolved: "answered" (grounded), "declined" (your probe said it could not
-    # determine the fact — an honest unknown), or "unreachable" / "rejected" /
-    # "malformed" / "unsignable" (your endpoint was not reached or answered
-    # unusably). Empty when no probes were consulted.
+    # ── Your checks: what was asked and how it went ───────────────────────────
+    # Which of your registered checks were asked for THIS verdict, and how each
+    # went: "answered", "declined" (your check said it could not tell — an
+    # honest unknown), or "unreachable" / "rejected" / "malformed" /
+    # "unsignable" (your endpoint was not reached or answered unusably). Empty
+    # when none was asked.
     #
-    # The check worth building in: compare these keys against the probes you
-    # registered (GET /v1/probes). A probe you registered that is ABSENT here
-    # was never consulted — a lost or stale registration, not a cautious
-    # engine. That distinction is invisible from the verdict alone.
+    # Worth checking: compare these keys against the checks you registered
+    # (GET /v1/probes). One you registered that is ABSENT here was never asked
+    # — a lost or stale registration. The verdict alone does not show that.
     probe_outcomes: dict[str, str] = field(default_factory=dict)
 
-    # Set only when the evidence channel itself failed: "degraded" (some probes
-    # did not answer) or "unavailable" (the probe registry could not be read).
-    # None means healthy. A REVIEW with this set is a broken evidence path;
-    # a REVIEW without it is the engine correctly asking for evidence.
+    # Set only when asking your checks itself failed: "degraded" (some did not
+    # answer) or "unavailable" (your registrations could not be read). None
+    # means healthy. A REVIEW with this set points at a broken check; a REVIEW
+    # without it is the service asking for something you have not supplied.
     evidence_channel: Optional[str] = None
 
     # Which facts failed and how, when evidence_channel is set.
@@ -474,10 +558,9 @@ class ArceziaCertificate:
     # "no_verdict_field", "malformed_outcome", "unreachable",
     # "signing_key_unavailable".
     #
-    # None means Level 4 did not run for this response: either no simulation
-    # webhook is registered for this domain, the verdict was not an ALLOW, or
-    # the verdict was served from the server's cache (simulation runs only on
-    # the solve path). None is an absence, never a pass.
+    # None means Level 4 did not run for this response (for example, no
+    # simulation webhook is registered for this domain, or the verdict was not
+    # an ALLOW). None is an absence, never a pass.
     #
     # An ALLOW carrying a degraded value here was NOT simulated, and is
     # indistinguishable from a simulated ALLOW in every other field — which is
@@ -485,23 +568,21 @@ class ArceziaCertificate:
     simulation_channel: Optional[str] = None
     simulation_channel_detail: Optional[str] = None
 
-    # Defenses that ran in reduced mode for this verdict, e.g.
-    # "probe_evidence_channel" or "description_canonicalization". The verdict is
-    # still fail-safe; this exists so an auditor can tell a full-coverage
-    # verdict from a degraded one.
+    # Protections that ran in reduced mode for this verdict (names as the
+    # service gives them). The verdict is still fail-safe; this exists so an
+    # auditor can tell a full-coverage verdict from a degraded one.
     degraded_defenses: list[str] = field(default_factory=list)
 
-    # Approval tokens accepted on presence alone because this account has no
-    # registered signing key ("user" and/or "production"). Register an Ed25519
-    # public key via POST /v1/account/token_key to make signatures mandatory.
+    # Approval tokens accepted without a signature because this account has no
+    # registered signing key ("user" and/or "production"). Register one with
+    # register_token_key() to make signatures mandatory.
     unverified_approvals: list[str] = field(default_factory=list)
 
-    # Operator absence channel state for this verdict (server v35+):
-    # "declared" (the account declared which facts may be read as absent for
-    # this action type), "undeclared" (nothing declared — every probe that saw
-    # nothing stays unresolved, so ordinary actions hold at REVIEW until the
-    # operator declares), or "unavailable" (the declaration store could not be
-    # read; the gate ran at full strength). None: server predates the field.
+    # Whether this account has said what its tools never do, for this verdict:
+    # "declared", "undeclared" (nothing said, so ordinary actions may hold at
+    # REVIEW until you say it — use a policy contract), or "unavailable" (it
+    # could not be read; the gate ran at full strength). None: the server does
+    # not send the field.
     absence_channel: Optional[str] = None
 
     # False when the capability envelope this verdict used was supplied
@@ -510,12 +591,12 @@ class ArceziaCertificate:
     # envelope was involved, or the server predates the field.
     envelope_signed: Optional[bool] = None
 
-    # ── Decision identity + provenance (server v31+) ─────────────────────────
+    # ── Decision identity + provenance ───────────────────────────────────────
     # The stored audit row this decision was written to. Cite log_id to
     # retrieve/verify the record later (GET /v1/audit/record/{log_id}), or
     # request_id to correlate with the X-Request-ID response header and your
     # own logs. None on older servers, or when the audit store could not
-    # report a row identity (an honest absence — never a synthesized id).
+    # report a row identity (an honest absence — never a made-up id).
     log_id: Optional[int] = None
     created_at: Optional[str] = None      # the stored row's timestamp (ISO-8601)
     request_id: Optional[str] = None
@@ -526,9 +607,9 @@ class ArceziaCertificate:
     # description; the description itself is never stored server-side.
     action_identity: Optional[dict] = None
 
-    # Which rulebook produced the verdict: "builtin", or sha256 of the custom
-    # domain YAML (resolvable via GET /v1/audit/ruleset/{hash}); and which
-    # deployed engine build decided it.
+    # Which rules produced the verdict: "builtin", or the hash of your custom
+    # domain (resolvable via GET /v1/audit/ruleset/{hash}); and an identifier
+    # of the service release that decided it.
     ruleset_hash: Optional[str] = None
     engine_version: Optional[str] = None
 
@@ -545,32 +626,67 @@ class ArceziaCertificate:
     # "resolved" etc.), or None when none were declared or the server predates
     # the field. Categories are add-only: declaring one can only tighten the
     # verdict, never loosen it.
-    data_categories: Optional[dict] = None
+    data_categories: Optional[Any] = None
+
+    # ── What to do next ──────────────────────────────────────────────────────
+    # On a REVIEW, `release` lists what would let the call proceed. Each item
+    # is one of: "approval:user", "approval:production", "check:<name>" (have
+    # your registered check answer), "contract:<fact>" (settle it in your
+    # contract), "scope:<envelope field>", "declare:<effect>" (state in your
+    # contract that the tool never has that effect), or "person".
+    release: list[str] = field(default_factory=list)
+    # On a BLOCK, `reason` says why: "fabrication", "contract:<your rule>",
+    # "scope:<envelope field>", "ceiling:<effect>" (your envelope forbids it),
+    # "safety:<effect>" or "safety" (a built-in rule).
+    reason: list[str] = field(default_factory=list)
+    # On a REVIEW whose `release` is a person's approval alone: the route
+    # through your own configuration (contract statements, checks, envelope)
+    # that would also let the call proceed without a person. Empty when there
+    # is none, or on an older service.
+    release_without_person: list[str] = field(default_factory=list)
+    # Why `contract_coverage` is not "covered": "no_contract_for_tool",
+    # "declarations_retired" or "unavailable". None when covered or unknown.
+    contract_coverage_reason: Optional[str] = None
+
+    # True when the service answered in reduced mode; the verdict is still
+    # fail-safe. `incident` is an opaque code to quote to support.
+    reduced_mode: bool = False
+    incident: Optional[str] = None
+
+    # Whether your policy contracts cover this call: "covered", "none", or
+    # "unavailable" (they could not be read; the gate ran at full strength).
+    contract_coverage: Optional[str] = None
 
     # The complete server response. Any field the server adds is visible here
     # without waiting for an SDK release — new observability should never be
     # gated behind a client upgrade.
     raw: dict = field(default_factory=dict)
 
-    # True only on a certificate this SDK synthesised because the engine could
+    # True only on a certificate this SDK synthesised because the service could
     # not be reached (see `_degraded_cert`). Never set on a parsed response, so
     # it cannot be confused with a genuine verdict. Backs `.degraded`.
     _synthetic: bool = False
 
+    def __post_init__(self) -> None:
+        # One answer in two spellings: `release` is `missing`, `reason` is
+        # `violated`, whichever the certificate was built from.
+        if not self.release and self.missing:
+            self.release = list(self.missing)
+        if not self.missing and self.release:
+            self.missing = list(self.release)
+        if not self.reason and self.violated:
+            self.reason = list(self.violated)
+        if not self.violated and self.reason:
+            self.violated = list(self.reason)
+
     @property
     def degraded(self) -> bool:
         """True if this certificate is a synthetic fallback (unverified).
-        A degraded cert was not verified by the engine — its credential is None
-        and its verdict is not grounded in a proof. This is a synthetic
-        fallback that must never be treated as a verified result.
 
-        Read from the flag the fallback constructor sets, not inferred. The
-        previous test — `credential is None and trust_score == 0.0` — is a
-        property of every genuine BLOCK that ran with no grounded evidence,
-        which is the normal state of a fresh integration. It reported those
-        real, engine-produced verdicts as outages. It never missed a synthetic
-        cert (both proxies always hold for one), so the error was one-sided and
-        fail-safe; it was still a wrong answer to 'did the engine verify this?'
+        A degraded cert was built locally because the service could not be
+        reached: nothing was verified and its credential is None. It must never
+        be treated as a verified result. Read from the flag the fallback
+        constructor sets, not inferred from other fields.
         """
         return self._synthetic
 
@@ -578,7 +694,7 @@ class ArceziaCertificate:
     def action_digest(self) -> Optional[str]:
         """sha256 of the action this verdict is ABOUT, or None.
 
-        Law P — the verdict in ∂≺(E) must be about E. The credential the server
+        A verdict must be about the action it was asked about. The credential the server
         mints is bound to this digest (`adg`), so a resource that presents the
         credential together with the digest gets "this token was issued for THIS
         action", not merely "for an action of this type in this session".
@@ -588,6 +704,9 @@ class ArceziaCertificate:
         None when the server predates `action_identity` (an honest absence — a
         digest is never recomputed here, because recomputing it locally would
         make the check compare the SDK against itself).
+
+        NOT the value for an approval token's `act` claim: use
+        `action_binding` for that (the two are different hashes).
         """
         ident = self.action_identity
         if not isinstance(ident, dict):
@@ -596,12 +715,40 @@ class ArceziaCertificate:
         return digest if isinstance(digest, str) and digest else None
 
     @property
+    def action_binding(self) -> Optional[str]:
+        """The value to put in an approval token's `act` claim, or None.
+
+        It identifies this exact call (tool, domain, statement and typed
+        arguments). An approval whose `act` is this value covers this call and
+        no other. This is the field the approval flow needs; `action_digest`
+        is a different hash (it binds the issued credential) and is refused
+        as an `act` value.
+        """
+        v = self.raw.get("action_binding")
+        if not (isinstance(v, str) and v):
+            ident = self.action_identity
+            v = ident.get("binding") if isinstance(ident, dict) else None
+        return v if isinstance(v, str) and v else None
+
+    @property
+    def credential_withheld(self) -> Optional[str]:
+        """Why an ALLOW came without its single-use pass, or None.
+
+        ``"no_session"`` is the advisory case (no session, so nothing to sign
+        a pass with); every other value is the service declining to stand
+        behind the ALLOW, and the framework adapters hold the call. None when
+        a pass was issued or the reply gave no reason.
+        """
+        v = self.raw.get("credential_withheld") if isinstance(self.raw, dict) else None
+        return v if isinstance(v, str) and v else None
+
+    @property
     def evidence_channel_healthy(self) -> bool:
         """False when this verdict ran with a broken evidence path.
 
-        A REVIEW with a healthy channel is the engine asking for evidence —
-        expected, no action needed. A REVIEW with an unhealthy channel means
-        probes did not answer: the verdict is still safe (it can never become
+        A REVIEW while this is True is the service asking for something you
+        have not supplied — expected. A REVIEW while it is False means your
+        checks did not answer: the verdict is still safe (it can never become
         ALLOW), but something in your integration needs a human. Use this to
         decide whether to page someone.
         """
@@ -621,10 +768,11 @@ class ArceziaCertificate:
     def semantic_block(self) -> bool:
         """A cross-step danger pattern fired for this session.
 
-        The per-action verdict may still be ALLOW: this action is unobjectionable
-        on its own, and the SEQUENCE is what is dangerous — a sensitive read
-        earlier plus an outbound send now. The server withholds the credential
-        when this happens; `allow` is False for the same reason.
+        This action may be unobjectionable on its own; the SEQUENCE is what is
+        dangerous — a sensitive read earlier plus an outbound send now. The
+        verdict is not ALLOW when this happens: a high-severity pattern holds
+        the action for a person (REVIEW), and a pattern that is a violation
+        refuses it (BLOCK). No credential is issued, and `allow` is False.
         """
         return self.chain_status == "SEMANTIC_BLOCK"
 
@@ -707,80 +855,74 @@ class ArceziaCertificate:
         return "cross-step scan did not run"
 
     # ── Where the door is ────────────────────────────────────────────────
-    # `violated` and `missing` say what went wrong. These say what would put
-    # it right: the checks nobody could make whose confirmation, by the
-    # system entitled to answer each one, would turn this verdict into ALLOW.
-    #
-    # Read from `raw` rather than parsed into a field, so a server that
-    # predates them degrades to "not reported" instead of raising.
+    # `release` (REVIEW) and `reason` (BLOCK) are the answer. The older
+    # accessors below are kept for one release, mapped from `release`, and
+    # warn once when used.
+
+    @property
+    def held_by(self) -> list:
+        """Deprecated: use ``release``."""
+        _deprecated_once("held_by", "release")
+        if isinstance(self.raw.get("held_by"), list):   # a pre-release service
+            return list(self.raw["held_by"])
+        return list(self.release)
+
+    @property
+    def blocked_by(self) -> list:
+        """Deprecated: use ``reason``."""
+        _deprecated_once("blocked_by", "reason")
+        if isinstance(self.raw.get("blocked_by"), list):
+            return list(self.raw["blocked_by"])
+        return list(self.reason)
 
     @property
     def to_reach_allow(self) -> list:
-        """The checks that would reach ALLOW, as the server reported them.
+        """Deprecated: use ``release``.
 
-        Each item is ``{"name", "value", "source", "channel", "minimised"}``:
-
-          name      the exact string to register a probe webhook under
-          value     what that check has to come back with (True / False)
-          source    which channel the domain says answers it
-          channel   one plain sentence naming who can answer
-          minimised whether this is the SMALLEST such set; False means it is
-                    every check still open, because there were too many to
-                    narrow down
-
-        Empty on an ALLOW, on a verdict that rests on facts already
-        established, and on a server that does not report the field. Use
-        ``to_reach_allow_reported`` / ``to_reach_allow_reachable`` to tell
-        those three apart — an empty list is not by itself an answer.
+        Each release item as ``{"name", "value", "source", "channel",
+        "minimised"}`` so code written against the older field keeps running:
+        ``name`` is the release item itself, ``source`` its kind, and
+        ``channel`` one plain sentence saying what to do.
         """
+        _deprecated_once("to_reach_allow", "release")
         items = self.raw.get("to_reach_allow")
-        if not isinstance(items, list):
-            return []
-        out = []
-        for i in items:
-            if not isinstance(i, dict) or not i.get("name"):
-                continue
-            out.append({
+        if isinstance(items, list):          # a service from before `release`
+            return [{
                 "name": str(i.get("name")),
-                # Defaults are the least useful, never the most permissive:
-                # an item with no stated value asks for True, which is what a
-                # grant needs, and an item with no channel says nothing rather
-                # than inventing one.
-                "value": i.get("value") if isinstance(i.get("value"), bool)
-                         else True,
+                "value": i.get("value") if isinstance(i.get("value"), bool) else True,
                 "source": str(i.get("source") or ""),
                 "channel": str(i.get("channel") or ""),
                 "minimised": bool(i.get("minimised", True)),
-            })
+            } for i in items if isinstance(i, dict) and i.get("name")]
+        if "release" not in self.raw:
+            return []
+        out = []
+        for item in self.release:
+            kind = item.split(":", 1)[0]
+            out.append({"name": item, "value": True, "source": kind,
+                        "channel": release_sentence(item), "minimised": True})
         return out
 
     @property
     def to_reach_allow_reachable(self):
-        """Three states, and the third is not False.
-
-        ``True``  — the list above is a set that would reach ALLOW.
-        ``False`` — the server established that NO confirmation of an
-                    unchecked fact changes this decision. It rests on facts
-                    already established; act on ``violated`` instead.
-        ``None``  — not reported: an ALLOW (nothing to reach), or a server
-                    that does not compute this. Never read as "no".
-        """
+        """Deprecated: True when a REVIEW names what would release it."""
         got = self.raw.get("to_reach_allow_reachable")
-        return got if isinstance(got, bool) else None
+        if isinstance(got, bool) or "to_reach_allow_reachable" in self.raw:
+            return got if isinstance(got, bool) else None
+        if self.verdict != "REVIEW" or "release" not in self.raw:
+            return None
+        return bool(self.release) or None
 
     @property
     def to_reach_allow_reported(self) -> bool:
-        """True when the server answered the question, either way."""
-        return "to_reach_allow_reachable" in self.raw
+        """Deprecated: True when the service reported a release list."""
+        return "release" in self.raw or "to_reach_allow_reachable" in self.raw
 
     @property
     def to_reach_allow_plain(self) -> list:
-        """The same answer as sentences, for a log line or a ticket.
-
-        One sentence per check: what to confirm, what it has to come back
-        with, and who can answer it. Empty when there is nothing to say, so a
-        caller can print the list unconditionally.
-        """
+        """Deprecated: use ``next_steps``."""
+        if "to_reach_allow" not in self.raw:
+            return self.next_steps if "release" in self.raw or "reason" in self.raw else []
         if self.to_reach_allow_reachable is False:
             return ["No unchecked fact would change this decision."]
         out = []
@@ -792,62 +934,41 @@ class ArceziaCertificate:
                 line += f" Who can answer: {i['channel']}."
             out.append(line)
         if out and not all(i["minimised"] for i in self.to_reach_allow):
-            out.append(
-                "This is every check still open, not the shortest set."
-            )
+            out.append("This is every check still open, not the shortest set.")
+        return out
+
+    @property
+    def next_steps(self) -> list:
+        """What to do next, one plain sentence per item (REVIEW: what releases
+        the call; BLOCK: why it was refused). Empty on an ALLOW."""
+        if self.verdict == "BLOCK":
+            return [reason_sentence(i) for i in self.reason]
+        out = [release_sentence(i) for i in self.release]
+        if self.release_without_person:
+            out.append("Or, without a person (each only if it is true): " + " ".join(
+                release_sentence(i) for i in self.release_without_person))
         return out
 
     def is_clean(self) -> bool:
-        """True only when the auxiliary danger channels POSITIVELY cleared this
+        """True only when the flags beside the verdict POSITIVELY cleared this
         action. Unknown is not clean.
 
-        This is the fail-closed reading of the flags that sit beside the
-        verdict:
-
           * ``fabrication_detected is False`` — the server looked and found
-            none. ``None`` (not reported) returns False here. Absence of an
-            accusation is not a finding of innocence.
-          * ``not semantic_block`` — the cross-step scan did not fire.
+            none. ``None`` (not reported) returns False here: a lost report
+            must not read as a clearance.
+          * ``not semantic_block`` — no cross-step finding for this session.
 
-        WHY THE TWO ABSENCES ARE TREATED DIFFERENTLY. This looks inconsistent
-        and is not; the asymmetry is derived, not chosen for convenience.
+        An absent ``chain_status`` does NOT by itself make the certificate
+        unclean: a single sessionless ``verify`` has no earlier step to compare
+        with, so there is nothing to report. If your deployment always uses
+        sessions and a missing report should stop the action, require it
+        explicitly: ``cert.is_clean() and cert.chain_status_reported``.
 
-        The fabrication check is PER-ACTION and always runs. So an absent
-        ``fabrication_detected`` can only be a report that was lost — an older
-        deployment, a proxy that dropped the key, a truncated body. There is no
-        legitimate reason for it to be missing, and a lost report must not read
-        as a clearance. Hence: absent → not clean.
-
-        The cross-step scan is PER-SESSION. ``chain_status`` is absent exactly
-        when the scan did not run, and its commonest cause is that there was no
-        session to scan across — a single sessionless ``verify`` has no earlier
-        step to compose with, so there is nothing for the scan to say. That is
-        a correct state, not a lost report. Requiring the scan here would refuse
-        every sessionless call, and would also refuse every response from a
-        server that predates the explicit ``"CLEAR"`` — a compatibility break
-        with no safety gain. Hence: absent → does not by itself make the
-        certificate unclean.
-
-        What that leaves open, stated rather than hidden: absence also covers
-        "the scan RAISED", which *is* a lost report, and nothing in the
-        response separates the two. A caller who needs the scan to have run
-        should say so explicitly — ``cert.is_clean() and
-        cert.chain_status_reported`` — which is what that accessor is for. The
-        adapters do not require it, because doing so would break sessionless
-        use for everyone to close a case only some deployments have.
-
-        It deliberately does NOT look at ``verdict``: the verdict is the
-        decision, it is always present, and ``allow`` / ``block`` / ``review``
-        remain the gate. ``is_clean()`` answers the different question "did the
-        evidence behind that decision actually get reported?", which is what
-        you want before treating an ALLOW as fully accounted for. A synthetic
-        (degraded) certificate is never clean, because nothing reported
-        anything about it.
-
-        It also does not look at ``denied_authority_axes``: a non-empty denial
-        list is the operator's own declared ceiling and is entirely normal on
-        an ALLOW, so it is not evidence of danger. Read that field through
-        ``denied_axes_or_unknown()``.
+        It does not look at ``verdict`` (``allow`` / ``block`` / ``review``
+        remain the gate); it answers "was everything behind that decision
+        actually reported?". A synthetic (degraded) certificate is never
+        clean. It also ignores ``denied_authority_axes``: a denial list is the
+        operator's own ceiling and is normal on an ALLOW.
         """
         return self.fabrication_detected is False and not self.semantic_block
 
@@ -895,12 +1016,7 @@ class ArceziaCertificate:
             fab = " (fabrication: not reported by this server)"
         if self.semantic_block:
             fab += " ⛓️ CROSS-STEP BLOCK: " + ", ".join(self.chain_patterns or ["pattern"])
-        return (
-            f"{icon} {self.verdict}{fab} | "
-            f"trust={self.trust_score:.0%} | "
-            f"preconditions={self.precondition_score:.2f} | "
-            f"{self.summary}"
-        )
+        return f"{icon} {self.verdict}{fab} | {self.summary}"
 
 
 # ── Transport helpers ─────────────────────────────────────────────────────────
@@ -990,7 +1106,31 @@ def _httpx_client():
 _KEEPALIVE = _os.environ.get("ARCEZIA_NO_KEEPALIVE", "").strip().lower() not in ("1", "true", "yes", "on")
 
 
+# E3c (2026-10-03): the API base a local connection helper serves, set by the
+# Claude Code hook (a short-lived process per tool call) so its requests ride
+# one warm connection. None everywhere else: nothing changes for other callers.
+_HELPER_API_URL: Optional[str] = None
+
+
+def _via_helper(method: str, url: str, headers: dict, body: Optional[bytes],
+                timeout: float) -> "tuple[int, dict] | None":
+    """(status, body) through the helper, or None when the helper cannot be
+    reached — then nothing was sent and the caller goes direct."""
+    if _HELPER_API_URL is None:
+        return None
+    from arcezia.integrations import _conn_helper as _ch
+    try:
+        status, raw = _ch.request(_HELPER_API_URL, method, url, headers, body, timeout)
+    except _ch.HelperUnavailable:
+        return None
+    return status, _decode_body(status, _read_text(lambda: raw, "response body"))
+
+
 def _once_post(url: str, headers: dict, body: dict, timeout: float) -> tuple[int, dict]:
+    _h = _via_helper("POST", url, {**headers, "Content-Type": "application/json"},
+                     json.dumps(body).encode(), timeout)
+    if _h is not None:
+        return _h
     if _TRANSPORT == "httpx":
         resp = _httpx_client().post(url, headers=headers, json=body, timeout=timeout)
         return resp.status_code, _decode_body(
@@ -1018,6 +1158,9 @@ def _once_post(url: str, headers: dict, body: dict, timeout: float) -> tuple[int
 
 
 def _once_get(url: str, headers: dict, timeout: float) -> tuple[int, dict]:
+    _h = _via_helper("GET", url, dict(headers), None, timeout)
+    if _h is not None:
+        return _h
     if _TRANSPORT == "httpx":
         resp = _httpx_client().get(url, headers=headers, timeout=timeout)
         return resp.status_code, _decode_body(
@@ -1027,6 +1170,27 @@ def _once_get(url: str, headers: dict, timeout: float) -> tuple[int, dict]:
         status, raw = _keepalive.request("GET", url, dict(headers), None, timeout)
         return status, _decode_body(status, _read_text(lambda: raw, "response body"))
     req = _urllib_request.Request(url, headers=headers, method="GET")
+    try:
+        with _urllib_request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, _decode_body(
+                resp.status, _read_text(resp.read, "response body"))
+    except _urllib_error.HTTPError as e:
+        return e.code, _decode_body(e.code, _read_text(e.read, "error body"))
+
+
+def _once_delete(url: str, headers: dict, timeout: float) -> tuple[int, dict]:
+    _h = _via_helper("DELETE", url, dict(headers), None, timeout)
+    if _h is not None:
+        return _h
+    if _TRANSPORT == "httpx":
+        resp = _httpx_client().delete(url, headers=headers, timeout=timeout)
+        return resp.status_code, _decode_body(
+            resp.status_code, _read_text(lambda: resp.text, "response body"))
+    if _KEEPALIVE:
+        from . import _keepalive
+        status, raw = _keepalive.request("DELETE", url, dict(headers), None, timeout)
+        return status, _decode_body(status, _read_text(lambda: raw, "response body"))
+    req = _urllib_request.Request(url, headers=headers, method="DELETE")
     try:
         with _urllib_request.urlopen(req, timeout=timeout) as resp:
             return resp.status, _decode_body(
@@ -1056,6 +1220,16 @@ def _with_retry(fn, retries: int) -> tuple[int, dict]:
             time.sleep(_backoff(attempt))
             attempt += 1
             continue
+        # The first copy of this call (same Idempotency-Key) is still running
+        # on the service: wait and ask again — the answer is the first copy's,
+        # and it is counted once.
+        if (status == 409 and isinstance(data, dict) and attempt < retries
+                and (data.get("error") == "idempotent_call_in_progress"
+                     or (isinstance(data.get("detail"), dict)
+                         and data["detail"].get("error") == "idempotent_call_in_progress"))):
+            time.sleep(max(1.0, _backoff(attempt)))
+            attempt += 1
+            continue
         return status, data
 
 
@@ -1065,6 +1239,71 @@ def _post(url: str, headers: dict, body: dict, *, retries: int = 2, timeout: flo
 
 def _get(url: str, headers: dict, *, retries: int = 2, timeout: float = 30.0) -> tuple[int, dict]:
     return _with_retry(lambda: _once_get(url, headers, timeout), retries)
+
+
+def _delete(url: str, headers: dict, *, retries: int = 2, timeout: float = 30.0) -> tuple[int, dict]:
+    return _with_retry(lambda: _once_delete(url, headers, timeout), retries)
+
+
+# start_session(principal_rules=...) default: keep the rules this client has.
+_KEEP_RULES = object()
+
+
+class DeclarationsRetired(ValueError):
+    """The service no longer accepts absence declarations from this key.
+
+    `contract` is what you sent, written as a policy contract; upload it with
+    `register_contract()` (add a `pack` per tool if its calls should keep a
+    built-in domain's rules)."""
+
+    def __init__(self, message: str, contract: "dict | None" = None):
+        super().__init__(message)
+        self.contract = contract or {}
+
+
+class ContractRefused(ValueError):
+    """The service refused a policy contract. `problems` lists what to fix
+    (for example, rules that can never hold or refuse any call)."""
+
+    def __init__(self, message: str, error: str = "", problems: "list | None" = None):
+        super().__init__(message)
+        self.error = error
+        self.problems = list(problems or [])
+
+
+class SigningKeyConflict(ArceziaAPIError):
+    """``register_token_key`` refused to replace the signing key on record.
+
+    ``fingerprint`` is the registered key's fingerprint, or None when the
+    service could not say which key is registered. Approvals signed with the
+    current key stop working once it is replaced, so replacing it needs
+    ``replace=True``.
+    """
+
+    def __init__(self, message: str, fingerprint: Optional[str] = None):
+        super().__init__(409, message)
+        self.fingerprint = fingerprint
+
+
+_DECLARATIONS_DEPRECATED = (
+    "Absence declarations are being replaced by policy contracts. State what a "
+    "tool never does with `not_present` in a contract and upload it with "
+    "register_contract(). declarations_as_contract() gives you the equivalent "
+    "contract."
+)
+
+
+def _warn_declarations_deprecated() -> None:
+    import warnings as _warnings
+    _warnings.warn(_DECLARATIONS_DEPRECATED, DeprecationWarning, stacklevel=3)
+
+
+def _grant_rejected(body) -> Optional[str]:
+    """The service's message when it refused a workspace grant, else None."""
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict) and detail.get("error") == "workspace_grant_rejected":
+        return str(detail.get("message") or "workspace grant rejected")
+    return None
 
 
 def _raise_for_status(status: int, body: dict) -> None:
@@ -1122,7 +1361,7 @@ def _is_local_address(addr) -> bool:
 def _refuse_local_address(host: str, raw_url: str) -> None:
     """Raise unless ``host`` resolves to public addresses only.
 
-    Law Ω applies to the resolution too: a host that CANNOT be resolved is not
+    The same rule applies to the resolution: a host that CANNOT be resolved is not
     a host that resolved to something safe. It is refused, and the message says
     which of the two it was, because "unreadable" and "clean" must not arrive
     as the same outcome.
@@ -1210,8 +1449,22 @@ class Arcezia:
         timeout: float = 30.0,
         mode: Optional[str] = None,
         data_subject_reference: Optional[str] = None,
+        signing_key: Optional[Any] = None,
+        account_id: Optional[int] = None,
     ):
         """
+        signing_key / account_id — the principal's Ed25519 PRIVATE key (the
+          one whose public half is registered with register_token_key) and
+          this key's numeric account id (token_key_status()["api_key_id"]).
+          With a signing key configured, every capability envelope this client
+          opens a session with is sent SIGNED (arcezia.signing.
+          mint_envelope_token), so the service records it as the principal's
+          own declaration; grants that count only when signed
+          (`workspace_roots`, `resource_scope`) then apply. Configure it only where the
+          principal's backend opens sessions, never in the agent's process.
+          account_id is looked up once (token_key_status, owner/admin) when
+          not given.
+
         on_error — behaviour when Arcezia is unreachable after retries. Applies
           to EVERY method that makes a network call, not only verify(); see the
           table in this class's docstring, and each method's own docstring.
@@ -1227,11 +1480,10 @@ class Arcezia:
           answer to either would be a false statement, not a cautious one.
 
         mode — "production" (default) or "development".
-          In development mode, infrastructure constraints (backup APIs,
-          capability envelopes, CI gates) are relaxed so developers can
-          experiment without external infrastructure. Structural safety
-          constraints (fabrication, exfiltration, authorization) remain
-          strict in both modes. Can also be set via ARCEZIA_ENV env var.
+          In development mode, checks that need production infrastructure are
+          relaxed so developers can experiment without it. Fabrication,
+          data-leak and authorization checks stay strict in both modes. Can
+          also be set via ARCEZIA_ENV env var.
 
         data_subject_reference — optional identifier for the person the
           following verifications are about (e.g. your own customer id).
@@ -1301,7 +1553,7 @@ class Arcezia:
                 # for test keys)"; the code accepted http for every key, which
                 # put the bearer key on the wire in the clear and let a
                 # compromised config aim verification at a plaintext service
-                # that always answers ALLOW (A5-10). Checked after the address
+                # that always answers ALLOW. Checked after the address
                 # so the more specific refusal is the one reported.
                 raise ValueError(
                     "ARCEZIA_API_URL must use https for live API keys, got "
@@ -1324,7 +1576,22 @@ class Arcezia:
         # set False are DENIALS — dropping them would widen authority during an
         # outage. Absence must not become permission.
         self._capability_envelope: Optional[dict] = None
+        # The session rules (principal_rules) every session this client opens
+        # carries. Replaced only by start_session(principal_rules=...), and a
+        # document the service refuses never replaces the one before it.
+        self._principal_rules: Optional[dict] = None
         self._data_subject_reference: Optional[str] = data_subject_reference
+        # The principal's envelope signing key (2026-10-01): loaded now, so a
+        # malformed key fails at construction, not at the first session.
+        self._signing_key = None
+        if signing_key is not None:
+            from arcezia.signing import _load_private_key
+            self._signing_key = _load_private_key(signing_key)
+        self._account_id: Optional[int] = account_id
+        # A signed workspace grant (`arcezia grant-workspace`, 2026-10-01):
+        # presented with every session this client opens. The token is
+        # already signed by the principal; this client never holds its key.
+        self._workspace_grant: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Outage policy — ONE implementation, used by every network call
@@ -1385,14 +1652,21 @@ class Arcezia:
         otherwise the client-level reference (if any) applies."""
         return override if override is not None else self._data_subject_reference
 
+    def _metered_headers(self) -> dict:
+        """Headers for a METERED call: one Idempotency-Key per logical call.
+        The same headers dict is reused by every retry `_post` makes, so a
+        retry after a timeout is the same call to the service and is counted
+        once (the service answers it from the first copy's result)."""
+        import secrets as _secrets
+        return {**self._headers(), "Idempotency-Key": _secrets.token_urlsafe(24)}
+
     def _headers(self) -> dict:
         return {
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
             "X-Arcezia-SDK": f"python/{_SDK_VERSION}",
-            # REQUIRED. The API sits behind a WAF that rejects the stdlib
-            # default agent ("Python-urllib/3.x") with 403 before the request
-            # reaches the API. httpx sends its own agent, but httpx is an
+            # REQUIRED. The API rejects the stdlib default agent
+            # ("Python-urllib/3.x") with 403. httpx sends its own agent, but httpx is an
             # optional dependency — without this header a plain
             # `pip install arcezia` fails every call on the urllib fallback.
             "User-Agent": _USER_AGENT,
@@ -1417,21 +1691,69 @@ class Arcezia:
         "trust_boundary_crossing",   # NOT "trust_crossing"
         "irreversible",
     })
+    # Names a contract may use for what a call does; never session grants.
+    _ACT_NAMES = frozenset({"recursive", "force_push", "permission_change", "privilege_escalation"})
+
+    @property
+    def session_id(self) -> Optional[str]:
+        """The session every verify() runs under, once one is open."""
+        return self._session_id
+
+    def attach_session(self, session_id: str) -> None:
+        """Continue an existing session instead of opening a new one.
+
+        The session's task, envelope and what earlier steps did all stay with
+        the session on the service; a client that re-attaches gets
+        them back. No network call is made here: the service checks the
+        session on the next request, and an unknown one fails that request
+        under the usual on_error policy.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("attach_session needs a non-empty session id")
+        self._session_id = session_id.strip()
 
     def start_session(
         self,
         capability_envelope: Optional[dict] = None,
+        principal_rules: Optional[dict] = _KEEP_RULES,  # type: ignore[assignment]
+        workspace_roots: Optional[list] = None,
     ) -> dict:
         """
         Create a session and sign the task manifest.
+
+        workspace_roots: optional, the absolute folders the agent works in
+            (e.g. the repository it was started in). A location inside one is
+            not read against Arcezia's default list of system locations, and
+            the words of a command line can be checked to stay inside it.
+            Added to the capability envelope as `workspace_roots`. It is a
+            grant, so it counts ONLY when the envelope is signed: with a
+            `signing_key` configured on this client the envelope is sent
+            signed; without one the service ignores the roots and says so
+            (`unverified_approvals` on each decision). "/" and relative paths
+            are refused. Pass real paths (os.path.realpath): the service
+            compares paths as text and cannot resolve symlinks on your
+            machine. They lapse with the envelope's expires_at.
+
+        principal_rules: optional, the user's own restrictions for this
+            session, in the policy-contract rule form: {"facts": {name:
+            {"means", "from"}}, "tools": {tool: {"rules": [...]}},
+            "all_tools": {"rules": [...]}}, each rule `never` or `require`.
+            They can only tighten what the owner's rules allow. A malformed
+            one is refused when the session is created (HTTP 422), and one
+            that cannot apply to a call's domain refuses that call (409).
+            A session reopened later carries them again. Omit the argument to
+            keep the rules this client already has; pass None to clear them.
+            A document the service refuses (any 4xx) is not kept: later
+            sessions carry the rules accepted before it. During an outage the
+            new document stays pending and is sent when the session opens.
 
         Call this at the start of each agent interaction. Returns the signed
         task manifest T — the immutable consent boundary for this session.
 
         Args:
-            capability_envelope: Optional human-signed scope authorization dict.
-                When provided, grounds action_within_task_scope for all verify()
-                calls in this session. Fields: allowed_domains (list[str]),
+            capability_envelope: Optional dict, set by a person, saying what
+                this session may do. It applies to every verify() call in the
+                session. Fields: allowed_domains (list[str]),
                 allowed_action_types (list[str]),
                 max_scope ("single_record"|"batch"|"limited"|"mass"),
                 expires_at (ISO-8601 str), routine_action_types (list[str]),
@@ -1447,18 +1769,14 @@ class Arcezia:
                 expires_at is ENFORCED at use time: after the declared
                 instant, the envelope's grants lapse (allowed lists,
                 max_scope, structural_authority axes set True, and
-                routine_action_types stop grounding anything — consequential
-                actions fall back to REVIEW), while its explicit denials
+                routine_action_types stop applying — consequential actions
+                fall back to REVIEW), while its explicit denials
                 (denied_action_types, axes set False) persist. An
                 unparseable expires_at counts as expired (fail closed).
 
-                routine_action_types declares which action types are ROUTINE
-                (low stakes) for this session — the operator-authored stakes
-                channel. Without it, an action that is neither provably inert
-                nor otherwise classified holds at REVIEW on unresolved
-                stakes. The declaration can never mask observed escalation: a
-                classified high-stakes type, keyword, or a typed amount at or
-                above the threshold always wins (the stricter reading is kept).
+                routine_action_types marks which action types are low-stakes
+                tools for this session. Without it, some ordinary actions hold
+                at REVIEW. It can never loosen a high-stakes call.
 
         Raises:
             ValueError: if structural_authority contains an unrecognised axis
@@ -1477,10 +1795,36 @@ class Arcezia:
                 and re-sent on that retry — dropping it would drop its DENIALS,
                 and an outage must not widen authority.
         """
+        if workspace_roots is not None:
+            if (not isinstance(workspace_roots, (list, tuple)) or not workspace_roots
+                    or not all(isinstance(r, str) and r.strip().startswith("/")
+                               and r.strip().rstrip("/") for r in workspace_roots)):
+                raise ValueError(
+                    "workspace_roots must be a non-empty list of absolute folder paths "
+                    "(the root '/' is not a workspace)")
+            capability_envelope = {**(capability_envelope or self._capability_envelope or {}),
+                                   "workspace_roots": [r.strip() for r in workspace_roots]}
         if capability_envelope:
             sa = capability_envelope.get("structural_authority")
             if isinstance(sa, dict):
                 unknown = sorted(set(sa) - self.STRUCTURAL_AUTHORITY_AXES)
+                # The four names for what a call does (2026-10-02). They are
+                # accepted in a contract (`not_present`, `present`, `commands`,
+                # rules), never as a session grant: the rules that read them
+                # protect against harm whatever the session was granted, and
+                # take a person's approval of the call or facts that settle it.
+                acts = [k for k in unknown if k in self._ACT_NAMES]
+                if acts:
+                    raise ValueError(
+                        f"structural_authority cannot grant {acts}: these name what a "
+                        f"call does, not a grant. A session's grants never lift the "
+                        f"rules that protect against them; those take a person's "
+                        f"approval of the call, or facts that settle it (your "
+                        f"contract's `commands`, or your system's per-call answer). "
+                        f"To forbid one, write a contract or session rule "
+                        f"{{\"when\": [\"{acts[0]}\"], \"never\": true}}. Valid axes: "
+                        f"{sorted(self.STRUCTURAL_AUTHORITY_AXES)}."
+                    )
                 if unknown:
                     raise ValueError(
                         f"Unrecognised structural_authority ax"
@@ -1493,11 +1837,36 @@ class Arcezia:
                     )
             # Validated before it is stored, so a rejected envelope is never
             # carried into a later implicit retry.
+            previous_envelope = self._capability_envelope
             self._capability_envelope = capability_envelope
-        return self._guarded(self._degrade_session, self._open_session)
+        else:
+            previous_envelope = self._capability_envelope
+        previous_rules = self._principal_rules
+        if principal_rules is not _KEEP_RULES:
+            self._principal_rules = principal_rules
+        try:
+            return self._guarded(self._degrade_session, self._open_session)
+        except ArceziaAPIError as exc:
+            # The service answered and refused: the document was never in
+            # force, so no later implicit session may carry it.
+            if 400 <= exc.status_code < 500:
+                self._principal_rules = previous_rules
+                # The same for an envelope the service refused (e.g. a 422 on
+                # an unreadable ceiling): never re-sent on a later session.
+                self._capability_envelope = previous_envelope
+            raise
 
-    def _open_session(self) -> dict:
+    def _open_session(self, capability_envelope: Optional[dict] = None,
+                      capability_envelope_token: Optional[str] = None) -> dict:
+        return self._open_session_impl(capability_envelope, capability_envelope_token)
+
+    def _open_session_impl(self, capability_envelope: Optional[dict] = None,
+                           capability_envelope_token: Optional[str] = None) -> dict:
         """Create the session on the wire. Unguarded on purpose.
+
+        An envelope passed here (a first action's) is used for this session
+        instead of the stored one; it is how a first-action envelope and the
+        session rules travel together, since only session creation takes rules.
 
         The implicit bootstrap inside verify()/verify_chain()/verify_outcome()
         calls THIS, not the public start_session(), so a session failure is
@@ -1506,8 +1875,16 @@ class Arcezia:
         contract would quietly become fail_closed.
         """
         payload: dict = {"task": self._task}
-        if self._capability_envelope:
-            payload["capability_envelope"] = self._capability_envelope
+        if capability_envelope_token:
+            payload["capability_envelope_token"] = capability_envelope_token
+        elif capability_envelope is not None:
+            payload.update(self._envelope_field(capability_envelope))
+        elif self._capability_envelope:
+            payload.update(self._envelope_field(self._capability_envelope))
+        if self._principal_rules:
+            payload["principal_rules"] = self._principal_rules
+        if self._workspace_grant:
+            payload["workspace_grant"] = self._workspace_grant
         status, body = _post(
             f"{self._api_url}/v1/session",
             self._headers(),
@@ -1515,15 +1892,45 @@ class Arcezia:
             retries=self._max_retries,
             timeout=self._timeout,
         )
+        if status == 400 and payload.get("workspace_grant") and _grant_rejected(body):
+            # The grant only widens what is cleared, so the service refusing
+            # it (a replaced signing key, another account's grant) must not
+            # stop the session: open it without roots, as with no grant, and
+            # stop presenting this one.
+            import warnings as _warnings
+            _warnings.warn(f"The workspace grant was refused and not used: {_grant_rejected(body)}",
+                           UserWarning, stacklevel=3)
+            self._workspace_grant = None
+            payload.pop("workspace_grant", None)
+            status, body = _post(
+                f"{self._api_url}/v1/session",
+                self._headers(),
+                payload,
+                retries=self._max_retries,
+                timeout=self._timeout,
+            )
         _raise_for_status(status, body)
         session_id = body.get("session_id")
         if not session_id:
             raise ArceziaTransportError(
                 "POST /v1/session returned no session_id; no session was created."
             )
+        replaced = self._session_id
         self._session_id = session_id
+        if replaced and replaced != session_id and (self._user_token or self._prod_token):
+            # An approval is signed for ONE session. Re-sending approvals that
+            # were attached to the session this one replaces makes the server
+            # refuse them (400) and fails the next call. They cannot apply
+            # here: drop them and say so.
+            import warnings as _warnings
+            _warnings.warn(
+                "A new session replaced the previous one; the approvals attached to "
+                "the previous session do not carry over. Ask for new approvals for "
+                "this session.", UserWarning, stacklevel=3)
+            self._user_token = None
+            self._prod_token = None
         # A new session inherits nothing server-side, so every approval the
-        # caller has ever handed us is pending again for THIS session.
+        # caller has handed us for it is pending for THIS session.
         self._pending_tokens = {
             t: v for t, v in (("user", self._user_token),
                               ("production", self._prod_token)) if v
@@ -1538,6 +1945,23 @@ class Arcezia:
         # a person clicked Approve and the system did not record it.
         self._flush_pending_tokens()
         return body
+
+    def _envelope_field(self, envelope: dict) -> dict:
+        """The request field for an envelope: signed with the configured key
+        (a fresh single-use token per session opening, retries included), or
+        plain when none is configured."""
+        if self._signing_key is None:
+            return {"capability_envelope": envelope}
+        from arcezia.signing import mint_envelope_token
+        if self._account_id is None:
+            acct = self.token_key_status().get("api_key_id")
+            if not isinstance(acct, int):
+                raise ArceziaTransportError(
+                    "the service did not report this key's account id, so the envelope "
+                    "cannot be signed; pass account_id= to Arcezia(...)")
+            self._account_id = acct
+        return {"capability_envelope_token": mint_envelope_token(
+            self._signing_key, envelope, api_key_id=self._account_id)}
 
     @staticmethod
     def _degrade_session(mode: str, exc: Exception) -> dict:
@@ -1584,8 +2008,7 @@ class Arcezia:
 
     def authorize(self, token: str) -> "Arcezia":
         """
-        Provide a signed user intent token.
-        Grounds user_explicit_authorization as GROUNDED.
+        Attach a person's approval (a signed user token) to this session.
 
         Order-independent: call it before or after start_session(). Called
         before, the token is buffered and attached the moment the session is
@@ -1619,7 +2042,7 @@ class Arcezia:
         return self
 
     def authorize_production(self, token: str) -> "Arcezia":
-        """Grounds production_explicit_authorization as GROUNDED.
+        """Attach a person's production approval.
 
         Order-independent in the same way as authorize(), and unreachable-Arcezia
         behaviour is identical: the token is kept pending and retried, and the
@@ -1665,7 +2088,7 @@ class Arcezia:
         self._pending_tokens.pop(token_type, None)
 
     # ------------------------------------------------------------------
-    # Credential validation (the resource side of Law P)
+    # Credential validation (the resource side: the credential names its action)
     # ------------------------------------------------------------------
 
     def validate_credential(
@@ -1674,6 +2097,7 @@ class Arcezia:
         action_type: Optional[str] = None,
         action_digest: Optional[str] = None,
         resource_id: Optional[str] = None,
+        action_binding: Optional[str] = None,
     ) -> dict:
         """Validate a single-use credential at the resource, before executing.
 
@@ -1685,13 +2109,18 @@ class Arcezia:
         the certificate and the binding is complete by default — `action_type`
         and `action_digest` are read off it, so the check answers "was this
         credential issued for this exact action" rather than "for some action of
-        this type in this session". That default is the point of the helper:
-        `action_digest` has been on the wire since server v31 and stayed opt-in
-        because nothing sent it.
+        this type in this session". That default is the point of the helper.
 
         Passing a raw string keeps the old, weaker question unless you also pass
         `action_digest` yourself; the response's `action_digest_checked` says
         which question was answered, so a resource can refuse the weak one.
+
+        `action_binding` binds the whole call — tool, domain, description and
+        typed parameters (``arcezia.signing.action_binding``) — and the answer's
+        ``call_bound`` says whether it was checked. It is never read off the
+        certificate: the point is to compute it from the call the resource is
+        about to perform. ``arcezia.actuator.require_pass`` does that and
+        refuses on anything but a bound yes.
 
         Returns the server's answer dict, always carrying ``"ok"``:
         ``{"ok": True, ...}`` when the credential authorises this action, and
@@ -1733,6 +2162,8 @@ class Arcezia:
             body["action_type"] = eff_type
         if eff_digest is not None:
             body["action_digest"] = eff_digest
+        if action_binding is not None:
+            body["action_binding"] = action_binding
         if resource_id is not None:
             body["resource_id"] = resource_id
 
@@ -1777,9 +2208,51 @@ class Arcezia:
         data_categories: Optional[list] = None,
         capability_envelope: Optional[dict] = None,
         capability_envelope_token: Optional[str] = None,
+        principal_request: Optional[str] = None,
+        supplied_facts: Optional[list] = None,
+        observed_prior_acts: Optional[list] = None,
+        domain_is_default: bool = False,
+        audience: Optional[str] = None,
     ) -> ArceziaCertificate:
         """
         Verify whether an action is safe to execute.
+
+        audience: the id of the one service that will perform this action. The
+        pass issued on an ALLOW then names it and is valid there only — which
+        is what lets that service check the pass offline
+        (``arcezia.actuator.require_pass(mode="offline")``). It narrows where
+        the pass works and never changes the verdict.
+
+        domain_is_default: True when ``domain`` is only your integration's
+        default for this tool name. A tool your policy contract covers is then
+        checked under the contract's domain instead of being refused for
+        naming another (the Claude Code hook sets it).
+
+        observed_prior_acts: optional, reads your integration let run without a
+            call since its last verified one, each as the shell read it
+            performed: ``{"action_type": "shell_read" | "shell_search",
+            "action_description": "cat /abs/path", "domain": ...}`` (the Claude
+            Code hook sends its in-workspace reads). The service reads each the
+            way it reads that shell read, and it can only ADD session facts
+            (a read of a credential file makes a later send hold), never clear
+            one. A service that predates the field ignores it.
+
+        supplied_facts: optional, facts of your registered checks evaluated
+            by your integration for this call and sent with it
+            (``arcezia.signing.SuppliedFactSigner`` / ``sign_supplied_fact``,
+            signed with your fact signing key, bound to this call, this
+            session's ``session_binding_id`` and a unique counter), so the
+            service need not call your check endpoint. Only for checks
+            registered with ``fact_mode="supplied"`` and only with a
+            ``session_id``. A fact that does not validate is unknown and the
+            check is called as usual. A supplied fact never approves a call,
+            lifts a limit, or overrules what the call itself shows.
+
+        principal_request: optional, the user's own request as they typed it.
+            Read as values only: when the call is held, the certificate names
+            the arguments whose value the request never gave
+            (cert.raw["unrequested_arguments"]). It decides nothing and is not
+            stored.
 
         capability_envelope / capability_envelope_token: present the session's
         envelope WITH the first action, so opening the session and deciding
@@ -1795,15 +2268,15 @@ class Arcezia:
         Args:
             action_type:        Tool name ("execute_sql", "write_file", …)
             action_description: Human-readable description of the action.
-            domain:             Constraint domain. Defaults to "agent_action".
-            agent_evidence:     Optional LLM-supplied evidence (llm_inferred only).
-            state_mutations:    Optional session state updates after this action executes
-                                (e.g. {"file_contains_secrets": True} after a write).
+            domain:             The area this action belongs to. Defaults to "agent_action".
+            agent_evidence:     Optional: what the agent says. It can never clear
+                                an action on its own.
+            state_mutations:    Optional session state updates after this action executes.
             action_parameters:  Optional flat map of scalar identifiers naming what
                                 the action touches (e.g. {"invoice_id": "402",
                                 "amount": 129.5}). Forwarded to your registered
-                                probe webhooks so they can answer by key lookup
-                                instead of parsing the description. Bounded:
+                                checks so they can look the values up instead
+                                of reading the description. Bounded:
                                 max 32 entries, string values max 512 chars.
                                 Populate it from your tool-call arguments, not
                                 from model-generated prose.
@@ -1842,7 +2315,15 @@ class Arcezia:
                 raise ValueError(
                     "this client already has a session; an envelope is fixed at session "
                     "creation — start a new client (or call start_session first)")
-            if not _first_action_envelope:
+            if _first_action_envelope and self._principal_rules:
+                # Only session creation takes rules, so this first action's
+                # envelope opens the session together with them, then the
+                # action is decided in it. Folding the envelope into the verify
+                # call instead would open a session WITHOUT the rules.
+                self._open_session(capability_envelope=capability_envelope,
+                                   capability_envelope_token=capability_envelope_token)
+                _first_action_envelope = False
+            elif not _first_action_envelope:
                 self._ensure_session()
 
             body: dict[str, Any] = {
@@ -1857,7 +2338,7 @@ class Arcezia:
                 if capability_envelope_token:
                     body["capability_envelope_token"] = capability_envelope_token
                 else:
-                    body["capability_envelope"] = capability_envelope
+                    body.update(self._envelope_field(capability_envelope))
             if self._mode and self._mode.lower() in ("development", "dev"):
                 body["mode"] = "development"
             if agent_evidence:
@@ -1871,9 +2352,19 @@ class Arcezia:
                 body["data_subject_reference"] = subject
             if data_categories is not None:
                 body["data_categories"] = data_categories
+            if principal_request is not None:
+                body["principal_request"] = principal_request
+            if supplied_facts is not None:
+                body["supplied_facts"] = list(supplied_facts)
+            if observed_prior_acts:
+                body["observed_prior_acts"] = list(observed_prior_acts)
+            if domain_is_default:
+                body["domain_is_default"] = True
+            if audience is not None:
+                body["audience"] = audience
 
             status, resp = _post(
-                f"{self._api_url}/v1/verify", self._headers(), body,
+                f"{self._api_url}/v1/verify", self._metered_headers(), body,
                 retries=self._max_retries, timeout=self._timeout,
             )
             _raise_for_status(status, resp)
@@ -1960,8 +2451,9 @@ class Arcezia:
             trust_score=0.0,
             summary=f"Arcezia unreachable ({exc}); degraded to {verdict} per on_error policy.",
             violated=[],
-            missing=["arcezia_reachable"],
-            # NOT False. The engine was never reached, so nothing looked for
+            missing=["person"],
+            release=["person"],
+            # NOT False. The service was never reached, so nothing looked for
             # fabricated evidence; claiming "none detected" here would be this
             # SDK asserting a finding it did not obtain. None = not reported,
             # which is what makes `is_clean()` False on every degraded
@@ -2036,9 +2528,8 @@ class Arcezia:
         """
         Verify a multi-step chain. Pass a chain manifest dict.
 
-        State from each step propagates to subsequent steps.
-        Semantic danger patterns (credential exfiltration, mass-destroy, etc.)
-        are detected across accumulated state.
+        Each step is judged in the light of the steps before it, so a plan
+        whose steps are fine alone but unsafe as a sequence is caught.
 
         data_subject_reference: optional per-call override of the client-level
         data subject (explicit value wins). Record-only — never changes any
@@ -2079,7 +2570,7 @@ class Arcezia:
 
             status, body = _post(
                 f"{self._api_url}/v1/verify_chain",
-                self._headers(),
+                self._metered_headers(),
                 body_out,
                 retries=self._max_retries,
                 timeout=self._timeout,
@@ -2160,7 +2651,7 @@ class Arcezia:
 
             status, body = _post(
                 f"{self._api_url}/v1/verify_outcome",
-                self._headers(),
+                self._metered_headers(),
                 body_out,
                 retries=self._max_retries,
                 timeout=self._timeout,
@@ -2218,14 +2709,21 @@ class Arcezia:
     # ------------------------------------------------------------------
 
     def declarations(self) -> dict:
-        """Read this key's `declared_absent` document and the declarable set.
+        """Read this key's `declared_absent` document.
 
-        Returns the server's `{"declared_absent": {...}, "declarable_constraints":
-        [...], "absence_channel": "declared" | "undeclared" | "unavailable"}`.
+        DEPRECATED: policy contracts replace declarations (see
+        `register_contract()` and `declarations_as_contract()`). The response's
+        `declarations_deprecated` says whether yours are still in force and
+        until when.
+
+        Returns the server's `{"declared_absent": {...}, "absence_channel": ...,
+        "declarations_deprecated": {...}}`.
         Raises ArceziaUnavailableError under every on_error setting when the
         service cannot be reached (nothing is gated here, so there is no safe
         degraded answer).
         """
+        _warn_declarations_deprecated()
+
         def _call() -> dict:
             status, body = _get(
                 f"{self._api_url}/v1/declarations", self._headers(),
@@ -2239,16 +2737,18 @@ class Arcezia:
     def declare_absent(self, declared_absent: dict) -> dict:
         """Replace this key's declarations: `{fact_name: [action_type, ...]}`.
 
-        You, not the agent, say which facts a given action type never carries —
-        e.g. that ``execute_sql`` never sends data outbound. A declaration only
-        resolves what the engine could NOT see; anything it detects still
-        stands. Admin role required. Never declare ``"*"``: the service refuses
-        it for a tool's own contract facts and it is a lie for the rest.
+        DEPRECATED: policy contracts replace declarations. Keys created after
+        the change cannot write them (DeclarationsRetired, carrying the
+        equivalent contract); older keys can until the transition window ends.
+        Put `not_present` in a contract and use `register_contract()` instead.
 
         Returns ``{"status": "ok", "declared_absent": {...}}`` as stored.
         Raises ValueError with the server's reason on a refused document (an
-        unknown fact name, a wildcard where none is accepted).
+        unknown fact name, a wildcard where none is accepted), and
+        DeclarationsRetired (a ValueError) when this key can no longer write
+        declarations.
         """
+        _warn_declarations_deprecated()
         if not isinstance(declared_absent, dict):
             raise ValueError("declared_absent must be a dict of {fact_name: [action_type, ...]}")
 
@@ -2260,6 +2760,232 @@ class Arcezia:
             )
             if status == 400:
                 raise ValueError(str((body or {}).get("detail") or body))
+            if status == 410:
+                detail = (body or {}).get("detail")
+                detail = detail if isinstance(detail, dict) else {"message": str(detail or body)}
+                raise DeclarationsRetired(str(detail.get("message") or ""), detail.get("contract"))
+            _raise_for_status(status, body)
+            return body
+
+        return self._guarded(None, _call)
+
+    def declarations_as_contract(self) -> dict:
+        """This key's declarations written as a policy contract.
+
+        Returns the server's `{"contract": {"tools": {tool: {"not_present":
+        [...]}}, ...}, "pack_candidates": {...}, ...}`. `pack` is left for you
+        to choose; `pack_candidates` only lists the built-in domains your
+        recent calls used for each tool. A wildcard declaration comes back as
+        `all_tools.not_present`, which covers only the tools the contract lists.
+        """
+        def _call() -> dict:
+            status, body = _get(
+                f"{self._api_url}/v1/declarations/as-contract", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return body
+
+        return self._guarded(None, _call)
+
+    # ------------------------------------------------------------------
+    # Policy contracts — your rules, per tool
+    # ------------------------------------------------------------------
+
+    def register_contract(self, contract: dict, name: Optional[str] = None) -> dict:
+        """Upload (or replace) a policy contract. Admin role required.
+
+        `name` defaults to the contract's `set`. The rules take effect at once
+        (they can only hold or refuse); the grants come back as
+        `session_grants` and take effect only once signed into a session's
+        capability envelope. The response says whether every rule can take
+        effect.
+
+        `envelope_fragment` is the deprecated name of `session_grants`: the
+        service sends both for one release, and this method fills
+        `session_grants` from `envelope_fragment` when talking to a service
+        that sends only the old name. Read `session_grants`.
+
+        Raises ContractRefused (a ValueError) when the service refuses the
+        contract — an invalid contract, or a rule that can never hold or
+        refuse any call (`problems` names them).
+        """
+        if not isinstance(contract, dict):
+            raise ValueError("contract must be a dict")
+        name = name or contract.get("set")
+        if not isinstance(name, str) or not name:
+            raise ValueError("give the contract a name (name=...) or a `set` field")
+
+        def _call() -> dict:
+            status, body = _post(
+                f"{self._api_url}/v1/contracts", self._headers(),
+                {"name": name, "contract": contract},
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            if status in (400, 409, 413, 422):
+                detail = (body or {}).get("detail")
+                detail = detail if isinstance(detail, dict) else {"message": str(detail or body)}
+                raise ContractRefused(str(detail.get("message") or ""),
+                                      str(detail.get("error") or ""), detail.get("problems"))
+            _raise_for_status(status, body)
+            return _with_session_grants(body)
+
+        return self._guarded(None, _call)
+
+    # ------------------------------------------------------------------
+    # Approval signing key
+    # ------------------------------------------------------------------
+
+    def set_workspace_grant(self, grant: Optional[str]) -> None:
+        """Present a signed workspace grant (minted by ``arcezia
+        grant-workspace`` on the principal's machine) with every session this
+        client opens from now on; None stops presenting one. The service
+        applies its roots while the grant is live (inside its window, not
+        revoked, signed by the account's current key); a lapsed or revoked
+        grant opens the session without roots and says so in the session
+        response (``workspace_grant.applied``)."""
+        if grant is not None and (not isinstance(grant, str) or grant.count(".") != 1):
+            raise ValueError("a workspace grant is a signed token '<payload>.<signature>'")
+        self._workspace_grant = grant
+
+    def revoke_workspace_grant(self, grant_id: str, expires_at: Optional[int] = None) -> dict:
+        """Revoke a workspace grant by id. Owner or admin. From the next
+        verification on, no session applies its roots."""
+        def _call() -> dict:
+            status, body = _post(
+                f"{self._api_url}/v1/account/workspace_grants/revoke", self._headers(),
+                {"grant_id": grant_id, "expires_at": expires_at},
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return body or {}
+
+        return self._guarded(None, _call)
+
+    def pass_keys(self) -> dict:
+        """The service's published keys for checking a pass offline.
+
+        ``{"scheme": "ed25519" | "unsigned", "keys": [{"kid", "public_key",
+        "fingerprint_sha256", "current"}], ...}``. Do not trust a key because
+        it came from here: pin its fingerprint out of band and use
+        ``arcezia.actuator.fetch_pass_keys``, which keeps only pinned keys.
+        """
+        def _call() -> dict:
+            status, body = _get(
+                f"{self._api_url}/v1/account/pass_keys", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return body if isinstance(body, dict) else {}
+
+        return self._guarded(None, _call)
+
+    def token_key_status(self) -> dict:
+        """What signing key this account has registered. Owner or admin.
+
+        Returns ``{"registered": bool, "fingerprint": str | None,
+        "api_key_id": int}``. ``fingerprint`` matches
+        ``arcezia.signing.public_key_fingerprint(your_public_key)``, so a
+        script can tell whether the key it holds is the one on record.
+        ``api_key_id`` is the value to pass as ``api_key_id=`` to
+        ``mint_token`` / ``mint_envelope_token`` (the token's ``acct``).
+        """
+        def _call() -> dict:
+            status, body = _get(
+                f"{self._api_url}/v1/account/token_key", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return {
+                "registered": bool((body or {}).get("registered")),
+                "fingerprint": (body or {}).get("fingerprint"),
+                "api_key_id": (body or {}).get("api_key_id"),
+            }
+
+        return self._guarded(None, _call)
+
+    def register_token_key(self, public_key: Any, *, replace: bool = False) -> dict:
+        """Register the Ed25519 PUBLIC key your approvals are signed with.
+        Owner or admin.
+
+        ``public_key`` is base64url text, 32 raw bytes, or an
+        ``Ed25519PublicKey``; ``None`` clears the key. Keep the private key
+        with the person or system that grants approval, never in the agent's
+        process.
+
+        Safe to run twice: registering the key already on record changes
+        nothing. If a DIFFERENT key is registered (or you pass ``None`` while
+        one is), this raises ``SigningKeyConflict`` and changes nothing,
+        because approvals signed with the current key would stop working.
+        Pass ``replace=True`` to replace or clear it on purpose. It also
+        raises ``SigningKeyConflict`` (``fingerprint=None``) when the service
+        cannot report which key is registered, since it then cannot confirm
+        nothing would be replaced.
+        """
+        from arcezia.signing import public_key_b64, public_key_fingerprint
+        encoded = None if public_key is None else public_key_b64(public_key)
+        new_fp = None if encoded is None else public_key_fingerprint(encoded)
+
+        def _call() -> dict:
+            if not replace:
+                try:
+                    current = self.token_key_status()
+                except ArceziaAPIError as exc:
+                    if exc.status_code in (404, 405):
+                        raise SigningKeyConflict(
+                            "This service cannot report which signing key is "
+                            "registered, so it cannot confirm nothing would be "
+                            "replaced. Pass replace=True to set it anyway."
+                        ) from None
+                    raise
+                if current["registered"] and current["fingerprint"] != new_fp:
+                    raise SigningKeyConflict(
+                        "A different signing key is already registered "
+                        f"(fingerprint {current['fingerprint']}). Approvals "
+                        "signed with it would stop working. Pass replace=True "
+                        "to replace it.",
+                        fingerprint=current["fingerprint"],
+                    )
+            status, body = _post(
+                f"{self._api_url}/v1/account/token_key", self._headers(),
+                {"public_key": encoded, "replace": bool(replace)},
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            if status == 409:
+                detail = (body or {}).get("detail")
+                detail = detail if isinstance(detail, dict) else {"message": str(detail or body)}
+                raise SigningKeyConflict(str(detail.get("message") or ""),
+                                         fingerprint=detail.get("fingerprint"))
+            _raise_for_status(status, body)
+            return body
+
+        return self._guarded(None, _call)
+
+    def contracts(self) -> list:
+        """The policy contracts registered for this key: a list of
+        `{"name", "domains", "created_at", "updated_at"}`."""
+        def _call() -> list:
+            status, body = _get(
+                f"{self._api_url}/v1/contracts", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
+            _raise_for_status(status, body)
+            return list((body or {}).get("contracts") or [])
+
+        return self._guarded(None, _call)
+
+    def delete_contract(self, name: str) -> dict:
+        """Delete a policy contract and the domains it compiled to. Admin role
+        required. Raises ArceziaAPIError (404) when there is no such contract."""
+        from urllib.parse import quote as _quote
+        if not isinstance(name, str) or not name:
+            raise ValueError("name is required")
+
+        def _call() -> dict:
+            status, body = _delete(
+                f"{self._api_url}/v1/contracts/{_quote(name, safe='')}", self._headers(),
+                retries=self._max_retries, timeout=self._timeout,
+            )
             _raise_for_status(status, body)
             return body
 
@@ -2318,7 +3044,7 @@ class Arcezia:
 
 # ── Parsing helpers ───────────────────────────────────────────────────────────
 
-_CERT_REQUIRED_FIELDS = ("verdict", "status", "trust_score", "summary")
+_CERT_REQUIRED_FIELDS = ("verdict", "status", "summary")
 
 
 def _parse_chain(body: dict) -> ArceziaChainResult:
@@ -2356,7 +3082,7 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
             f"no verdict was obtained."
         )
 
-    # ── The three auxiliary flags with an honest "not reported" (T7) ─────────
+    # ── The three auxiliary flags with an honest "not reported" ─────────
     # Each of these was previously read with a permissive default — False, [],
     # None-as-clear — so a server that omitted the key was indistinguishable
     # from one that had checked and found nothing. That is absence converted
@@ -2365,24 +3091,50 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
     _fab = resp.get("fabrication_detected")
     _axes = resp.get("denied_authority_axes")
 
+    # `release` / `reason` are the current service's answer. A service from
+    # before them sent `missing` / `violated` instead; those are read as the
+    # same lists so this SDK works against either during an upgrade.
+    if isinstance(resp.get("release"), list):
+        _release = [str(i) for i in resp["release"] if isinstance(i, str)]
+    else:
+        _release = [str(i) for i in (resp.get("missing") or []) if isinstance(i, str)]
+    if isinstance(resp.get("reason"), list):
+        _reason = [str(i) for i in resp["reason"] if isinstance(i, str)]
+    else:
+        _reason = [str(i) for i in (resp.get("violated") or []) if isinstance(i, str)]
+    _reduced = resp.get("reduced_mode") is True
+    _cov = resp.get("contract_coverage")
+    _score = resp.get("precondition_score", resp.get("dc_score"))
+    _old_marks = resp.get("degraded_defenses")
+
     return ArceziaCertificate(
         verdict=resp["verdict"],
         status=resp["status"],
-        precondition_score=resp.get("precondition_score", resp.get("dc_score", 0.0)),
-        trust_score=resp["trust_score"],
+        precondition_score=_score if isinstance(_score, (int, float)) else None,
+        trust_score=(resp.get("trust_score")
+                     if isinstance(resp.get("trust_score"), (int, float)) else None),
         summary=resp["summary"],
-        violated=resp.get("violated", []),
-        missing=resp.get("missing", []),
+        violated=list(_reason),
+        missing=list(_release),
+        release=_release,
+        reason=_reason,
+        release_without_person=[str(i) for i in (resp.get("release_without_person") or [])
+                                if isinstance(i, str)],
+        contract_coverage_reason=(resp.get("contract_coverage_reason")
+                                  if isinstance(resp.get("contract_coverage_reason"), str) else None),
+        reduced_mode=_reduced,
+        incident=resp.get("incident") if _reduced else None,
+        contract_coverage=_cov if isinstance(_cov, str) else None,
         fabrication_detected=None if _fab is None else bool(_fab),
-        fabricated_constraints=resp.get("fabricated_constraints", []),
+        fabricated_constraints=list(resp.get("fabricated_constraints") or []),
         # Copied, not aliased: `raw` is a shallow copy of the response, so
         # handing out the same list object would let a caller's append mutate
         # what `raw` reports the server said.
         denied_authority_axes=list(_axes) if isinstance(_axes, list) else None,
-        unresolved=resp.get("unresolved", []),
+        unresolved=list(resp.get("unresolved") or []),
         chain_status=resp.get("chain_status"),
         chain_patterns=[
-            p.get("pattern_name", str(p)) if isinstance(p, dict) else str(p)
+            str(p.get("plain") or p.get("pattern_name") or "") if isinstance(p, dict) else str(p)
             for p in (resp.get("chain_patterns") or [])
         ],
         probe_outcomes=resp.get("probe_outcomes") or {},
@@ -2390,9 +3142,14 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
         evidence_channel_failures=resp.get("evidence_channel_failures") or {},
         simulation_channel=resp.get("simulation_channel"),
         simulation_channel_detail=resp.get("simulation_channel_detail"),
-        degraded_defenses=resp.get("degraded_defenses") or [],
+        degraded_defenses=(list(_old_marks) if isinstance(_old_marks, list) and _old_marks
+                           else [str(resp.get("incident") or "reduced_mode")] if _reduced
+                           else []),
         unverified_approvals=resp.get("unverified_approvals") or [],
-        absence_channel=resp.get("absence_channel"),
+        absence_channel=(resp.get("absence_channel") if resp.get("absence_channel") is not None
+                         else {"covered": "declared", "none": "undeclared",
+                               "unavailable": "unavailable"}.get(_cov)
+                         if isinstance(_cov, str) else None),
         envelope_signed=(resp.get("envelope_signed")
                          if isinstance(resp.get("envelope_signed"), bool)
                          else None),
@@ -2407,11 +3164,8 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
         signed_at=resp.get("signed_at"),
         data_categories=resp.get("data_categories"),
         raw=dict(resp),
+        # Only an older service sends a fact table; the current one does not.
         constraints=[
-            # Read defensively: a truncated or partial constraint row must not
-            # crash the parse, and every default here is the LEAST trusted
-            # reading — value None (unresolved, never True) and quality
-            # UNRESOLVED — so a missing field can only tighten, never loosen.
             ArceziaConstraintDetail(
                 name=c.get("name", "unknown"),
                 value=c.get("value"),
@@ -2419,9 +3173,22 @@ def _parse_cert(resp: dict) -> ArceziaCertificate:
                 detail=c.get("detail", ""),
                 quality_plain=c.get("quality_plain", ""),
             )
-            for c in resp.get("constraints", [])
+            for c in resp.get("constraints", []) or []
             if isinstance(c, dict)
         ],
         signature=resp.get("signature", ""),
         credential=resp.get("credential"),
     )
+
+
+def _with_session_grants(body):
+    """A contract-registration reply with `session_grants` present: the public
+    name of the grants the principal signs into a session envelope. A service
+    from before the rename (2026-10-02) sends them only as `envelope_fragment`
+    (deprecated, sent beside `session_grants` for one release); both are read.
+    """
+    if isinstance(body, dict) and "session_grants" not in body and isinstance(
+            body.get("envelope_fragment"), dict):
+        body = {**body, "session_grants": body["envelope_fragment"]}
+    return body
+

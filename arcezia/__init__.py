@@ -54,7 +54,7 @@ Level 2 — Chain verification (verify the plan, not just the step)
 
         # An ArceziaChainResult: .overall_verdict, .blocked_at, .steps,
         # .semantic_triggers, .human_summary, .degraded — plus .raw for
-        # anything else the server sent (final_state, ...).
+        # anything else the server sent (release, reason, ...).
         # No top-level "verdict" — per-step verdicts are under .steps.
         if not result.safe:
             abort(result.blocked_at)          # the step_id that failed
@@ -72,19 +72,18 @@ Level 2 — Chain verification (verify the plan, not just the step)
             expected={"rows_affected": 1},      # what you intended
         )
 
-Level 3 — Ground the evidence (stop trusting the agent's claims)
-    Register a probe webhook so Arcezia asks YOUR systems for the facts
-    instead of believing what the model asserts. Without this, evidence is
-    CLAIMED; with it, evidence is GROUNDED.
+Level 3 — Let your systems answer (stop trusting the agent's claims)
+    Connect a check so your system answers instead of the agent:
 
-        POST /v1/probes   {"domain": ..., "constraint": ..., "url": ...}
+        POST /v1/probes   {"domain": ..., "constraint_name": ...,
+                           "webhook_url": ..., "secret": ...}
 
-    Human intent cannot be produced by a model — ground it explicitly:
+    A person's approval cannot be produced by a model — attach it explicitly:
 
         toolkit.az.authorize(token=request.headers["X-Arcezia-Token"])
 
 Level 4 — Custom & compliance domains
-    Define your own constraint domains (Level 4 needs Level 3 to be useful).
+    Define your own rules (Level 4 needs Level 3 to be useful).
 
         POST /v1/domains  {"name": "payment_ops_strict", ...}
 
@@ -116,6 +115,9 @@ from arcezia.client import (  # noqa: F401
     ArceziaTransportError,
     ArceziaAPIError,
     ArceziaAuthError,
+    ContractRefused,
+    DeclarationsRetired,
+    SigningKeyConflict,
 )
 from arcezia.integrations.universal import guard, guard_callable  # noqa: F401
 
@@ -125,5 +127,6 @@ __all__ = [
     "ArceziaOutcomeResult", "ArceziaBlockError", "ArceziaReviewError",
     "ArceziaUpgradeRequired", "ArceziaRateLimitError", "ArceziaUnavailableError",
     "ArceziaTransportError", "ArceziaAPIError", "ArceziaAuthError",
+    "ContractRefused", "DeclarationsRetired", "SigningKeyConflict",
     "guard", "guard_callable",
 ]

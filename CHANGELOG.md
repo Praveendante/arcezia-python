@@ -4,12 +4,139 @@ All notable changes to the `arcezia` Python SDK.
 
 This file starts at 1.0.6. Earlier releases are described by their git history.
 
-## 1.0.6 — unreleased
+## 1.0.7 — unreleased
 
-Security release. Every change below came out of the 2026-09-10 audit and its
-fix derivation (`docs/security/FIX-DERIVATION-2026-09-11.md`); each one closes a
-path on which something could execute without a verdict that was about it, or on
-which an absent answer read as a permissive one.
+Needs a server released on or after this SDK; publish the server first.
+
+### An ALLOW runs only on a pass for the call about to run
+- Every framework adapter (universal guard, LangChain/LangGraph, OpenAI,
+  CrewAI, Anthropic dispatch and filter, AutoGen, OpenCLAW dispatch and CLI
+  hook, LlamaIndex, Claude Code hook) now runs an `ALLOW` only when its
+  single-use pass names the call about to run — the binding recomputed from
+  the arguments that will execute (`arcezia.signing.action_binding`) — or
+  when no pass was issued because there was no session (`no_session`). An
+  `ALLOW` whose pass was withheld for any other reason, or with no pass and
+  no reason, or with a pass for a different call, is held with a plain
+  reason. A pass from a service that signs only the description digest is
+  matched through the digest and the reply's `action_binding`.
+- `cert.credential_withheld`: why an `ALLOW` came without its pass.
+- `arcezia.actuator.require_pass(...)`: for the service that acts. Checks the
+  pass for exactly the call it is about to perform and raises `PassRefused`
+  on anything but a bound yes; the pass is spent once. `mode="online"`
+  (default), `"offline"` (Ed25519 signature against pinned keys, the pass must
+  name this service, local `UsedPasses` register) or `"both"`.
+  `fetch_pass_keys(...)` returns only the keys whose fingerprint you pinned.
+- `verify(..., audience=...)`: name the one service that will perform the
+  action; its pass is valid there only. `pass_keys()` reads the published
+  pass keys.
+- `validate_credential(..., action_binding=...)`: binds the whole call (the
+  answer's `call_bound` says whether it was checked).
+
+### Contract registration: `session_grants`
+- `register_contract()` returns the grants to sign into a session envelope as
+  `session_grants`. `envelope_fragment` is the same object under its old name,
+  deprecated: the service sends both for one release, then only
+  `session_grants`. The SDK reads both, so `session_grants` is present against
+  an older service too.
+
+### Signed envelopes and the agent's workspace
+- `Arcezia(signing_key=..., account_id=...)`: with the principal's Ed25519
+  private key configured, every capability envelope the client opens a
+  session with is sent signed (`arcezia.signing.mint_envelope_token`, a fresh
+  single-use token per opening). Configure it where the principal's backend
+  opens sessions, never in the agent's process. `account_id` is looked up
+  once through `token_key_status()` when not given.
+- `start_session(workspace_roots=[...])`: the absolute folders the agent
+  works in, added to the envelope. A grant, so it counts only when the
+  envelope is signed; unsigned, the service ignores it and reports the
+  envelope in `unverified_approvals`. `/` and relative paths are refused.
+- Claude Code hook: forwards the real path of its working directory
+  (`action_parameters.cwd`, symlinks resolved) with every act, and sends a
+  whole command line under `COMMAND_LINE_ACTION_TYPE` (`run_shell`), the type
+  the hosted service reads as a command line. Decisions are unchanged.
+
+### Response format: what to do next, and nothing else
+The service now answers with the verdict and what your next action needs:
+
+- `cert.release` (on REVIEW): what would let the call proceed. Each item is
+  `approval:user`, `approval:production`, `check:<name>` (have your registered
+  check answer), `contract:<fact>`, `scope:<envelope field>`,
+  `declare:<effect>` (state in your contract that the tool never has that
+  effect), or `person`.
+- `cert.reason` (on BLOCK): why it was refused: `fabrication`,
+  `contract:<your rule>`, `scope:<envelope field>`, `ceiling:<effect>` (your
+  envelope forbids it), or `safety:<effect>` / `safety` (a built-in rule).
+- `cert.next_steps`: the same, one plain sentence per item.
+- `cert.summary` is built from those items only.
+- `cert.reduced_mode` / `cert.incident`: the service answered in reduced mode
+  (the verdict is still fail-safe); quote the incident code to support.
+- `cert.contract_coverage`: `covered`, `none` or `unavailable`.
+- `credential_withheld` takes one of `not_allowed`, `plan_not_cleared`,
+  `fabrication`, `no_session`, `unavailable`.
+
+Deprecated for one release, mapped from the new fields and warning once:
+`held_by`, `blocked_by`, `to_reach_allow` (+ `_reachable`, `_reported`,
+`_plain`). `cert.missing` now lists the release items and `cert.violated` the
+reason items. `trust_score` and `precondition_score` are `None` (the service
+no longer reports them); `cert.constraints` and `cert.unresolved` are empty.
+Adapters (Claude Code hook, LangChain, OpenAI, AutoGen, CrewAI, n8n, ...) show
+the new summary and items; every gate still reads only `verdict`,
+`fabrication_detected`, `chain_status` and `credential`. Against an older
+service the SDK reads its `missing` / `violated` fields into the same lists.
+
+### Added
+- Policy contracts: `register_contract()`, `delete_contract()`,
+  `declarations_as_contract()`; `DeclarationsRetired` / `ContractRefused` exported.
+- `start_session(principal_rules=...)`: the user's own restrictions for a
+  session (they only ever tighten); re-sent when a session is re-opened.
+- `verify(principal_request=...)`: a hold names the arguments the user's own
+  request never gave (`cert.raw["unrequested_arguments"]`).
+- `cert.action_binding`: the value for an approval token's `act` claim
+  (`action_digest` is a different hash and is refused as `act`).
+- `token_key_status()`: whether a signing key is registered, its fingerprint,
+  and the `api_key_id` an approval token's `acct` needs.
+- `register_token_key(public_key, replace=False)`: registers the approval
+  signing key. It raises `SigningKeyConflict` and changes nothing when a
+  different key is already registered (or when the service cannot say which
+  key is registered); pass `replace=True` to replace or clear it. Registering
+  the same key again is a no-op. `arcezia.signing.public_key_fingerprint()`
+  computes the fingerprint locally.
+
+### Behaviour changes (these can change what a working integration sees)
+- AutoGen, CrewAI (`ArceziaCrewTool`) and `ArceziaGuard.wrap_function` raise
+  `ArceziaBlockError` on BLOCK and `ArceziaReviewError` on REVIEW, carrying the
+  certificate as `err.cert`. Both subclass `RuntimeError`, so an existing
+  `except RuntimeError` still catches them, and the message text is unchanged.
+- Claude Code hook: reads (Read, Grep, Glob, LS, NotebookRead) inside the
+  working directory run without a call; reads that reach outside it are
+  verified. Shell commands are verified per program with finer action types;
+  an existing envelope that allows `run_shell` keeps working unchanged.
+- Absence declarations are retired for keys created after the server's
+  cutover (`DeclarationsRetired`, HTTP 410); use a policy contract.
+- A second `start_session()` drops approvals attached to the session it
+  replaces (they are bound to that session and would be refused).
+- An envelope or session rules the service refuses (4xx) are not kept for
+  later sessions.
+
+### Documentation
+- The README and the examples read `release`, `reason` and `next_steps`, and a
+  plan's `reason` and plain `semantic_triggers`, in place of the deprecated
+  fields. Webhook examples check `X-Arcezia-Signature-V2` with the
+  `signing_key_v2` shown once at registration, and approval examples attach
+  tokens signed with a registered key; a made-up string is refused.
+
+### Fixed
+- Shell typing: a `#` mid-word no longer hides a second command; `wget`
+  (saves a file), `less +cmd` and `git diff --ext-diff/--textconv` are
+  verified as the shell act they are.
+- The hook recognises the service's 409 `session_expired` and opens a new
+  session with the envelope and rules.
+
+## 1.0.6 — released
+
+Security release. Each change below closes a path on which something could
+execute without a verdict that was about it, or on which an absent answer read
+as a permissive one.
 
 **Read this first if you are upgrading:** several behaviours that used to let a
 call through now refuse it. That is the point of the release. Each one is listed
@@ -40,7 +167,7 @@ under *Behaviour changes* with what will now fail and what to do about it.
   *If this starts raising for you, the server is returning something this SDK
   does not recognise — read `cert.raw["verdict"]`; do not catch and continue.*
 
-- **An ALLOW whose fabrication channel never reported is not a clearance.** The
+- **An ALLOW whose fabrication result was never reported is not a clearance.** The
   adapters refuse it. `cert.fabrication_status` is three-state and prints in
   words, so "the server did not say" no longer reads as "checked, clean".
 
@@ -99,8 +226,7 @@ under *Behaviour changes* with what will now fail and what to do about it.
   certificate rather than the raw token and the binding is complete by default:
   `action_type` and `action_digest` are read off it, so the server answers "was
   this credential issued for THIS action" instead of "for some action of this
-  type in this session". `action_digest` has been on the wire since server v31
-  and stayed opt-in because nothing sent it. A refusal (HTTP 403) is returned as
+  type in this session". A refusal (HTTP 403) is returned as
   `{"ok": False, "error": …}` — an answer, not an exception; transport failures
   raise, and a raise means "not validated". There is no degraded fallback.
 
@@ -120,10 +246,9 @@ under *Behaviour changes* with what will now fail and what to do about it.
   arguments — the authorised text and the executed text were different things,
   and the clip was invisible, so a long benign prefix authorised whatever
   followed. There is now one shared `describe()` across all adapters with a
-  32 768-character budget (the same constant and marker the engine uses), a
-  max-min fair share across arguments so a huge sibling cannot starve the small
-  argument holding the target, and ` [TRUNCATED n]` appended when it clips. The
-  engine treats that marker as unresolved, never as a clean short action.
+  32 768-character budget, a fair share across arguments so a huge one cannot
+  crowd out a small one, and ` [TRUNCATED n]` appended when it clips, so a
+  clipped description is never read as a clean short action.
 
 - Typed arguments (`action_parameters`) are forwarded by every adapter that
   holds them, including the classic LangChain path, which used to stringify and
@@ -143,7 +268,7 @@ under *Behaviour changes* with what will now fail and what to do about it.
   input, non-object JSON, a missing tool name, a verifier that could not be
   constructed, and a missing API key. It used to answer `"review"` on three of
   those; a missing key is not a held action, it is an ungated one. `"review"` is
-  now reachable only from an engine REVIEW.
+  now reachable only from a REVIEW verdict.
 
 ### Fixed
 
@@ -152,8 +277,3 @@ under *Behaviour changes* with what will now fail and what to do about it.
 - The `n8n` module docstring's approval section, which described a flow the
   template did not implement.
 
----
-
-### Not published
-
-1.0.6 has not been uploaded to PyPI. This entry describes the tree.

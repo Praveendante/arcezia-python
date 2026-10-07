@@ -41,14 +41,13 @@ Custom evidence provider:
         return {"file_is_in_sandbox": args.get("path","").startswith("/tmp/"))
 
     guard = DispatchGuard(..., evidence_provider=my_probe)
-    # Note: evidence from `evidence_provider` is CLAIMED — the agent side
-    # asserted it, so it is recorded but never treated as authoritative.
-    # For GROUNDED evidence register a webhook probe via POST /v1/probes.
+    # Note: what `evidence_provider` returns is what the agent side says. It
+    # is recorded but can never clear an action on its own. Connect a check
+    # (POST /v1/probes) so your system answers instead of the agent.
 
 Active-permission ledger:
-    When principal memory is enabled (ARCEZIA_PRINCIPAL_MEMORY=1) the hosted
-    engine tracks the capability ledger cross-session. Locally the guard can
-    also maintain a session-scoped ledger (query with guard.active_permissions).
+    The guard keeps a session-scoped record of what it let through (query it
+    with guard.active_permissions).
 
 Beyond Level 1
 --------------
@@ -75,7 +74,7 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
                           outcome={"rows_affected": 50000},
                           expected={"rows_affected": 1})
 
-    # Level 3 — ground human intent (a model cannot forge this)
+    # Level 3 — attach a person's approval (a model cannot produce this)
     guard.az.authorize(token=user_approval_token)
 
 Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
@@ -94,8 +93,10 @@ from arcezia.client import ArceziaBlockError, ArceziaReviewError, ArceziaUnavail
 from arcezia.integrations._params import scalar_params
 from arcezia.integrations._common import (
     ACTION_KEYS as _ACTION_KEYS,
+    call_of,
     coerce_az,
     describe,
+    pass_hold_reason,
     refuse_unless_clean,
 )
 from arcezia.integrations.universal import _infer_domain
@@ -104,12 +105,14 @@ from arcezia.integrations.universal import _infer_domain
 # ── domain inference for generic tool names ────────────────────────────────────
 
 def _dispatch_describe(tool_name: str, args: dict) -> str:
-    """One shared description for every adapter — see ``_common.describe``.
-
-    "Concise" was the defect: 80 chars per value and 500 overall, while
-    ``dispatch`` executed the full arguments (A5-5).
-    """
+    """One shared description for every adapter — see ``_common.describe``."""
     return describe(tool_name, kwargs=args, priority=_ACTION_KEYS)
+
+
+def _dispatch_call(tool_name: str, args: dict, domain: str) -> dict:
+    """The dispatched call exactly as `DispatchGuard._verify` sends it."""
+    return call_of(tool_name, domain, _dispatch_describe(tool_name, args),
+                   scalar_params(args))
 
 
 # ── DispatchGuard ──────────────────────────────────────────────────────────────
@@ -149,8 +152,10 @@ class DispatchGuard:
             block_on_review:   If True (default), REVIEW raises ArceziaReviewError.
                                If False, REVIEW actions pass through unblocked.
             evidence_provider: Callable(tool_name, args) → dict[str, bool].
-                               Provides per-call CLAIMED evidence.  For GROUNDED
-                               evidence, register a probe webhook via POST /v1/probes.
+                               What the agent side says, per call; it can
+                               never clear an action on its own. Connect a
+                               check (POST /v1/probes) so your system answers
+                               instead of the agent.
             review_handler:    Callable(cert) → bool. Called on REVIEW instead of
                                raising. Return True to allow; False to block.
                                Typical use: prompt the human ("allow? [y/N]").
@@ -162,13 +167,6 @@ class DispatchGuard:
                                own ``az`` the policy is already that client's,
                                and passing a different one here raises rather
                                than being ignored.
-
-                               It WAS ignored: this parameter was accepted and
-                               never forwarded to coerce_az, so a guard built
-                               with on_error="review" fail-closed instead, and a
-                               guard built with on_error="fail_open" raised
-                               during an outage. A safety setting that does
-                               nothing is worse than one that is absent.
             data_subject_reference: Optional identifier for the person these
                                verifications are about. Record-only — never
                                changes a verdict; enables per-person audit lookup.
@@ -180,8 +178,8 @@ class DispatchGuard:
         self._block_on_review = block_on_review
         self._evidence_provider = evidence_provider
         self._review_handler = review_handler
-        # Session-scoped active-permission ledger (domain:action_type → bool).
-        # Mirrors what the server tracks in the session when memory is on.
+        # Session-scoped record of what this guard let through
+        # (domain:action_type → time).
         self._active_permissions: dict[str, float] = {}
 
     @property
@@ -194,7 +192,7 @@ class DispatchGuard:
 
             .az.verify_chain(manifest)     # Level 2 — verify a whole plan
             .az.verify_outcome(...)        # post-execution audit
-            .az.authorize(token)           # Level 3 — ground human intent
+            .az.authorize(token)           # Level 3 — attach a person's approval
         """
         return self._client
 
@@ -249,9 +247,10 @@ class DispatchGuard:
                     "The action was not verified by the engine."
                 )
             )
-        # An ALLOW whose fabrication channel never reported is not a
-        # clearance (T7). One helper, every adapter — see _common.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming the call about to
+        # run (recomputed from `args`). One helper, every adapter — see _common.
+        refuse_unless_clean(cert, self._call_for(tool_name, args, domain))
         import time
         self._active_permissions[f"{domain or self._default_domain or _infer_domain(tool_name)}:{tool_name}"] = time.time()
         if fn is not None:
@@ -289,9 +288,10 @@ class DispatchGuard:
                     "The action was not verified by the engine."
                 )
             )
-        # An ALLOW whose fabrication channel never reported is not a
-        # clearance (T7). One helper, every adapter — see _common.
-        refuse_unless_clean(cert)
+        # An ALLOW whose fabrication result was never reported is not a
+        # clearance, and an ALLOW runs only on a pass naming the call about to
+        # run (recomputed from `args`). One helper, every adapter — see _common.
+        refuse_unless_clean(cert, self._call_for(tool_name, args, domain))
         import time
         self._active_permissions[f"{domain or self._default_domain or _infer_domain(tool_name)}:{tool_name}"] = time.time()
         if fn is not None:
@@ -340,7 +340,7 @@ class DispatchGuard:
                 # `asyncio.to_thread(fn, ...)` branch and handed back the
                 # un-awaited coroutine object: the upstream dispatch never ran,
                 # and the caller got a coroutine where a result was expected
-                # (A5-16, "coroutine was never awaited").
+                # ("coroutine was never awaited").
                 async def _fwd(**a):
                     return await dispatch_fn(tool_name, a, **kw)
                 return await guard.adispatch(tool_name, args, fn=_fwd, domain=domain)
@@ -353,22 +353,28 @@ class DispatchGuard:
 
     # ── internal verify ───────────────────────────────────────────────────────
 
+    def _call_for(self, tool_name: str, args: dict, domain: Optional[str] = None) -> dict:
+        """The call `_verify` sends for these arguments, recomputed at the
+        moment it is checked against the pass (see _common)."""
+        return _dispatch_call(tool_name, args,
+                              domain or self._default_domain or _infer_domain(tool_name))
+
     def _verify(self, tool_name: str, args: dict, *, domain: Optional[str] = None):
-        dom = domain or self._default_domain or _infer_domain(tool_name)
-        desc = _dispatch_describe(tool_name, args)
+        # One computation of the call, shared with the pass check (_call_for).
+        call = self._call_for(tool_name, args, domain)
         evidence: Optional[dict] = None
         if self._evidence_provider:
             try:
                 evidence = self._evidence_provider(tool_name, args)
             except Exception:
-                pass  # evidence provider failure = Ω, never a block
+                pass  # a failing evidence provider sends nothing; it never clears anything
         return self._client.verify(
-            action_type=tool_name,
-            action_description=desc,
-            domain=dom,
+            action_type=call["action_type"],
+            action_description=call["description"],
+            domain=call["domain"],
             agent_evidence=evidence or None,
-            # Typed dispatch args -> probe lookup keys (bounds-safe projection).
-            action_parameters=scalar_params(args),
+            # Typed dispatch args, forwarded to your registered checks.
+            action_parameters=call["parameters"],
         )
 
 
@@ -390,7 +396,7 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
 
     What a host MUST do with each decision — the contract this function is
     written against, stated because an unstated one is how "review" came to be
-    returned for three absences (A5-14):
+    returned for three absences:
 
         "block"   the tool MUST NOT run. This is also what every failure and
                   every absence returns: unparseable input, no tool name, no
@@ -398,20 +404,16 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
                   that raised, a degraded certificate, an unreported
                   fabrication check.
         "review"  the tool MUST NOT run until a PERSON approves it. It is
-                  returned only when the engine actually reached a REVIEW
+                  returned only when the service actually returned a REVIEW
                   verdict — i.e. it is a verified state, never a fallback. A
                   host that cannot hold an action for a human must treat
                   "review" as "block"; set ARCEZIA_REVIEW_MODE=block to have
                   that decided here instead.
-        "allow"   the engine returned ALLOW, the certificate is not degraded,
-                  and the fabrication channel positively reported clean.
+        "allow"   the service returned ALLOW, the certificate is not degraded,
+                  and the fabrication check positively reported clean.
     """
-    # Law Ω: these three are absences, not holds. "review" is a NON-REFUSAL in
-    # a protocol whose host behaviour this module does not define — it names no
-    # host, so it cannot assume one enforces a hold — and the sibling
-    # claude_code hook answers the same three with a decision its host does
-    # enforce. A missing API key is not a held action; it is an UNGATED one
-    # (A5-14). All three block, and the reason says which absence it was.
+    # Unparseable input, no tool name and no API key are not holds: nothing
+    # was verified. All three block, and the reason says which it was.
     try:
         payload = json.loads(stdin_text) if stdin_text.strip() else {}
     except json.JSONDecodeError:
@@ -442,7 +444,7 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
         except Exception as exc:
             # Constructing the guard is part of verifying: a bad ARCEZIA_API_URL
             # or ARCEZIA_ON_ERROR raises here, and an escaping exception is not
-            # a decision (the same defect as A5-2 in the Claude Code hook).
+            # a decision.
             return _cli_decision(
                 "block", f"Arcezia BLOCK: could not build the verifier "
                          f"(fail-closed): {exc}")
@@ -462,19 +464,24 @@ def run_cli_hook(stdin_text: str, *, verifier=None) -> dict:
     if cert.degraded:
         return _cli_decision("block", f"Arcezia BLOCK (degraded cert — unverified): {cert.summary}")
     if not cert.is_clean():
-        # T7: same rule as every other surface — an unreported fabrication
-        # check is not a passed one.
+        # Same rule as every other surface: an unreported fabrication check
+        # is not a passed one.
         return _cli_decision(
             "block",
             f"Arcezia BLOCK (not cleared: {cert.fabrication_status}): {cert.summary}")
     if cert.review:
         if os.environ.get("ARCEZIA_REVIEW_MODE", "review").lower() == "block":
-            return _cli_decision("block", f"Arcezia REVIEW→block (re-request with grounding): {cert.summary}")
+            return _cli_decision("block", f"Arcezia REVIEW→block (attach the missing approval or check, then retry): {cert.summary}")
         return _cli_decision("review", f"Arcezia REVIEW (human approval required): {cert.summary}")
     # Allow is POSITIVE — see the identical note in claude_code.run_hook. A
     # verdict that matches none of the branches above is not an allow; it is a
     # response this hook does not understand.
     if cert.allow:
+        # The pass rule every adapter applies (see _common.pass_hold_reason).
+        held = pass_hold_reason(
+            cert, _dispatch_call(tool_name, args if isinstance(args, dict) else {}, dom))
+        if held is not None:
+            return _cli_decision("block", f"Arcezia {held} {cert.summary}")
         return _cli_decision("allow", f"Arcezia ALLOW: {cert.summary}")
     return _cli_decision(
         "block",

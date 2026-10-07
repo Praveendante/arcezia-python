@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arcezia"
-version = "1.0.6"
+version = "1.0.7"
 description = "Runtime safety enforcement for autonomous AI agents — official Python SDK"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,6 +31,8 @@ dependencies = []
 # version matrix in noxfile.py / .github/workflows/integrations.yml).
 [project.optional-dependencies]
 httpx     = ["httpx>=0.27"]
+# `arcezia-verify-records`: checks an exported record file offline (Ed25519).
+verify    = ["cryptography>=41"]
 langchain = ["langchain>=0.2", "langchain-core>=0.2", "httpx>=0.27"]
 langgraph = ["langgraph>=0.2", "langchain-core>=0.2", "httpx>=0.27"]
 openai    = ["openai>=1.30", "httpx>=0.27"]
@@ -53,11 +55,20 @@ all = [
 # `arcezia-hook install` wires the Claude Code PreToolUse hook; with no args it
 # acts as the hook (reads the tool call on stdin, emits the permission decision).
 arcezia-hook = "arcezia.integrations.claude_code:main"
+# `arcezia grant-workspace <root>... --for 8h` — principal side: signs the
+# agent's workspace with the key from the OS keychain; writes only the grant.
+arcezia = "arcezia.cli:main"
+# `arcezia-verify-records export.ndjson --public-key keys.json` — for an auditor:
+# checks signatures, order and completeness of an export, offline. Imports
+# nothing else from this package; the one file also runs on its own.
+arcezia-verify-records = "arcezia.verify_records:main"
 
 [project.urls]
 Homepage      = "https://arcezia.com"
-Documentation = "https://arcezia.com/developer-docs"
-Repository    = "https://github.com/Praveendante/arcezia-python"
+Documentation = "https://arcezia.com/developer-docs/"
+Integrations  = "https://arcezia.com/integrations/"
+Source        = "https://github.com/Praveendante/arcezia-python"
+Changelog     = "https://github.com/Praveendante/arcezia-python/blob/main/CHANGELOG.md"
 "Bug Tracker" = "https://github.com/Praveendante/arcezia-python/issues"
 
 [tool.setuptools.packages.find]

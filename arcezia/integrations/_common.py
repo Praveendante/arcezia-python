@@ -7,49 +7,16 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 # ── The one action description ────────────────────────────────────────────────
 #
-# The description is the channel the engine's structural rules actually read:
-# the mass-scope and DML rules parse `action_description` (sqlparse runs on it),
-# and `action_parameters` is consulted only for a fixed set of key names that
-# does NOT include `query` or `sql`. So a clipped description is not a shorter
-# action — it is a DIFFERENT, safer-looking action, while the adapter goes on to
-# execute the full, unclipped arguments. Every adapter had its own ceiling (80
-# chars PER ARGUMENT in universal/autogen/openclaw, 200 or 300 total in the
-# OpenAI paths, and a single key in anthropic and in ArceziaCrewTool), and each
-# one authorised a destructive statement on its harmless-looking prefix (A5-5).
-#
-# One function, one budget, all arguments, and — the load-bearing part — an
-# explicit marker whenever anything was dropped, so a clipped description
-# reaches the engine as a VISIBLE UNKNOWN rather than as a clean short action.
-# Per Law D the marker may only tighten: it can add danger, never remove it.
-#
-# [M] DESCRIBE_BUDGET = 100_000 — the server's own `action_description` bound
-# (server/main.py `_sanity_bound_text`), i.e. the largest value that can never
-# be rejected at the seam. Candidates measured against the benchmark corpus
-# (696 action_description values across our benchmark and test corpora:
-# p50 = 49, p95 = 115, max = 157 chars):
-# {157, 500, 1_000, 4_000, 16_000, 32_768, 100_000} all clear the corpus, so the
-# corpus alone does not separate them. Two further criteria do. (a) A budget
-# must introduce no NEW clip on a path that does not clip today — the Claude
-# Code hook already sends a Write/Edit's FULL file content unclipped, so the
-# budget must be far above any honest description; that rules out everything
-# through 16 000. (b) The SAME number must hold on both sides of the seam: the
-# service-side copy of this function uses 32 768, and two budgets for one contract is two
-# distinctions where the boundary made one — a description clipped at one end
-# and not the other is exactly the disagreement this fix removes. 32 768 is
-# therefore the argmin: above every observed case by more than two orders of
-# magnitude, below the server's own 100 000-char field bound by a margin that
-# leaves the marker room, and identical to the engine's.
+# Describe every argument of a tool call, and mark any truncation, so a long
+# call is never read as a shorter, safer action than the one that executes.
+# Every adapter uses this one function and this one budget.
 DESCRIBE_BUDGET = 32768
 
-# Every argument is guaranteed this many characters before ANY argument is
-# clipped, so one huge value cannot starve the small one holding the target.
-# [M] MIN_ARG_CHARS = 512 — the API's own per-value bound for
-# `action_parameters` (`_params.MAX_VALUE_CHARS`), so an argument that survives
-# whole in the typed channel also survives whole in the prose one.
+# Every argument is guaranteed this many characters before any argument is
+# clipped, so one huge value cannot crowd out a small one.
 MIN_ARG_CHARS = 512
 
-# The marker the engine keys on. Kept as a named constant, not a literal, so
-# the producing side and the consuming side name the same distinction.
+# Appended whenever text was clipped, so the clip is visible.
 TRUNCATION_MARKER = "[TRUNCATED"
 
 # Argument names that usually CARRY the action rather than qualify it. Only an
@@ -88,14 +55,8 @@ FAIL_OPEN_ADAPTER_WARNING = (
 def _clip(text: str, budget: int) -> str:
     """Clip ``text`` to ``budget`` and say so when anything was dropped.
 
-    The marker is spelled exactly as the engine-side copy spells it —
-    ``" [TRUNCATED n]"``, n = characters dropped — so one string identifies a clipped
-    description wherever it was produced. Two spellings would be two
-    distinctions for one fact.
-
-    The RESULT — marker included — is within ``budget``: the budget must stay
-    under the server's hard field bound, so a marker that pushed the string
-    past it would turn every long action into a 422 instead of a verdict.
+    Appends ``" [TRUNCATED n]"`` (n = characters dropped). The result, marker
+    included, fits within ``budget``.
     """
     if len(text) <= budget:
         return text
@@ -114,23 +75,18 @@ def describe(
     priority: Iterable[str] = (),
     budget: int = DESCRIBE_BUDGET,
 ) -> str:
-    """Render a tool call as the action description the engine will read.
+    """Render a tool call as the action description sent for verification.
 
     ALL positional and keyword arguments are included — the shape is
     ``action_type(arg0, arg1, key=value, …)`` — and nothing is dropped
-    silently: every clip carries ``[TRUNCATED n]`` — the same marker text the
-    engine-side copy writes, n = characters dropped.
+    silently: every clip carries ``[TRUNCATED n]``, n = characters dropped.
 
-    Budget is shared max-min fairly across the arguments: an argument shorter
-    than its equal share is never clipped, and the room it does not use is
-    redistributed to the long ones. That matters because the dangerous value is
-    not reliably the long one — clipping ``path`` to make room for a 40 KB
-    ``content`` would hide exactly the field the path rules read.
+    The budget is shared fairly across the arguments: an argument shorter than
+    its equal share is never clipped, and the room it does not use goes to the
+    long ones.
 
-    ``priority`` orders the keys that carry the action itself (``command``,
-    ``sql``, …) to the front, so on a call so large that even the fair share
-    bites, the fields the structural rules parse are the ones at the head of
-    the string rather than wherever the dict happened to order them.
+    ``priority`` moves the keys that usually carry the action itself
+    (``command``, ``sql``, …) to the front of the string.
     """
     kwargs = kwargs or {}
     prio = [k for k in priority if k in kwargs]
@@ -172,50 +128,133 @@ def describe(
     return _clip(f"{action_type}({', '.join(parts)})", budget)
 
 
-def refuse_unless_clean(cert: Any) -> None:
-    """Raise unless the auxiliary danger channels POSITIVELY cleared the action.
+# ── The single-use pass ───────────────────────────────────────────────────────
+#
+# On an ALLOW the service hands out a single-use pass (`cert.credential`) bound
+# to the call it decided about. When it allows but will not stand behind the
+# ALLOW it withholds the pass and says why (`credential_withheld`). Exactly one
+# of those reasons leaves the call runnable here: "no_session" — an advisory
+# check made without a session, where there is no session key to sign a pass
+# with. Every other reason (an integrity failure, a plan that did not clear,
+# rejected evidence) is the service declining, and no reason at all is an
+# unexplained absence. Neither is permission.
+ADVISORY_WITHHELD = "no_session"
 
-    One helper, called at every adapter's refusal point, so "an absent
-    fabrication report is not a clearance" is decided in one place rather than
-    fourteen. See ``ArceziaCertificate.is_clean``.
 
-    Why it sits BESIDE the verdict gates rather than inside them: `cert.allow`
-    reads `verdict`, which is the decision and is always present, so it is left
-    exactly as it was — inverting it would refuse every response from a server
-    that predates the field. This is the second, additive question: did the
-    evidence behind that ALLOW actually get reported? A `None` there used to
-    parse as `False` and read as "checked, clean". It now reaches here as an
-    unknown, and an unknown does not execute.
+def call_of(action_type: str, domain: Optional[str], description: str,
+            parameters: Optional[dict] = None) -> dict:
+    """The call about to run, as the pass check reads it.
 
-    Reached only after an adapter has already cleared block / review /
-    degraded, so on any server that reports the flag — every current
-    deployment — this changes nothing at all.
+    ``domain=None`` means the service chose the rule set (the caller sent its
+    default and asked the service to use a covering contract's instead); the
+    domain the reply was decided under is then the expected one.
+    """
+    return {"action_type": action_type, "domain": domain,
+            "description": description, "parameters": parameters}
+
+
+def _withheld_of(cert: Any) -> Optional[str]:
+    v = getattr(cert, "credential_withheld", None)
+    if not (isinstance(v, str) and v):
+        raw = getattr(cert, "raw", None)
+        v = raw.get("credential_withheld") if isinstance(raw, dict) else None
+    return v if isinstance(v, str) and v else None
+
+
+def pass_hold_reason(cert: Any, call: Optional[dict]) -> Optional[str]:
+    """Why an ALLOW must not run here, in plain words; None when it may.
+
+    An ALLOW runs only when
+      (a) it carries a pass and the pass names the call about to run — its
+          binding equals ``arcezia.signing.action_binding`` computed from the
+          arguments that will execute; or
+      (b) it carries no pass and the service said why: ``no_session``.
+
+    Only certificates that carry the pass field are subject to this. A
+    verifier object written without one (the caller's own stand-in, never a
+    reply of this service: ``ArceziaCertificate`` always has the field) keeps
+    the earlier contract; a reply from the service cannot select that branch.
+
+    The in-process check is a consistency check, not containment: an agent
+    that can call the tool directly never meets it. Containment is the
+    actuator refusing without a valid pass — see ``arcezia.actuator``.
+    """
+    if not hasattr(cert, "credential"):
+        return None
+    cred = getattr(cert, "credential", None)
+    token = cred.get("token") if isinstance(cred, dict) else None
+    if isinstance(token, str) and token:
+        if not isinstance(call, dict):
+            return ("Held: the pass cannot be checked against the call about to "
+                    "run, because the call was not given to the check.")
+        domain = call.get("domain")
+        if domain is None:
+            ident = getattr(cert, "action_identity", None)
+            domain = ident.get("domain") if isinstance(ident, dict) else None
+            if not (isinstance(domain, str) and domain):
+                return ("Held: the reply does not say which rules it was decided "
+                        "under, so the pass cannot be matched to this call.")
+        import hashlib
+        import hmac
+        from arcezia.signing import action_binding
+        expected = action_binding(call.get("action_type") or "", domain,
+                                  call.get("description") or "", call.get("parameters"))
+        bound = cred.get("action_binding")
+        if isinstance(bound, str) and bound:
+            if hmac.compare_digest(bound, expected):
+                return None
+            return ("Held: the single-use pass was issued for a different call "
+                    "than the one about to run.")
+        # A pass from a service that signs only the description digest: it is
+        # tied to this reply by the digest, and the reply names the call.
+        digest = cred.get("action_digest")
+        if not (isinstance(digest, str) and digest):
+            return ("Held: the single-use pass does not name the call it was "
+                    "issued for, so it cannot be matched to this one.")
+        here = hashlib.sha256((call.get("description") or "").encode()).hexdigest()
+        reply = getattr(cert, "action_binding", None)
+        if (hmac.compare_digest(digest, here) and isinstance(reply, str)
+                and hmac.compare_digest(reply, expected)):
+            return None
+        return ("Held: the single-use pass was issued for a different call "
+                "than the one about to run.")
+    withheld = _withheld_of(cert)
+    if withheld == ADVISORY_WITHHELD:
+        return None
+    if withheld:
+        return (f"Held: the service allowed this call but withheld its single-use "
+                f"pass ({withheld}), so it did not stand behind the ALLOW.")
+    return ("Held: the service allowed this call but sent no single-use pass and "
+            "gave no reason. An unexplained absence is not permission.")
+
+
+def refuse_unless_clean(cert: Any, call: Optional[dict] = None) -> None:
+    """Raise unless the certificate positively clears the action.
+
+    Called at every adapter's refusal point. A verdict that is not ALLOW (or a
+    REVIEW the operator chose to let through with ``block_on_review=False`` or
+    a ``review_handler``) is refused, and so is an ALLOW whose fabrication
+    result was not reported: not reported is not the same as clean. See
+    ``ArceziaCertificate.is_clean``.
+
+    An ALLOW is also refused unless its single-use pass names ``call`` — the
+    call about to run, built with ``call_of`` from the arguments that will
+    execute — or the service withheld the pass only because there was no
+    session. See ``pass_hold_reason``.
 
     ``ArceziaBlockError`` subclasses ``RuntimeError``, so an existing
     ``except RuntimeError`` around a guarded tool still catches it, and
-    ``str(cert)`` names the missing report.
+    ``str(cert)`` names what was missing.
     """
     from arcezia.client import ArceziaBlockError
-    # Allow is POSITIVE here too. Every adapter reaches this line by ELIMINATION
-    # — "not block, not review, not degraded" — and a verdict that is none of
-    # the three satisfied none of those tests and executed: a renamed value, an
-    # empty string, a lowercase "allow". That is the same inversion the n8n node
-    # and the MCP proxy carried (A5-3, A5-4), and this is the one place all
-    # thirteen adapter call sites pass through, so it is fixed once here rather
-    # than thirteen times. `cert.allow` is the conjunction the SDK already
-    # defines: verdict is the literal "ALLOW", fabrication not detected, no
-    # cross-step semantic block.
-    #
-    # `cert.review` is admitted alongside it because reaching this line on a
-    # REVIEW is a DECLARED choice, not an omission: `block_on_review=False` and
-    # a `review_handler` that returns True are operator channels that say "let a
-    # held action through". A verdict that is none of ALLOW / BLOCK / REVIEW was
-    # never declared by anyone, and that is the case being closed.
     if getattr(cert, "allow", False) is not True and getattr(cert, "review", False) is not True:
         raise ArceziaBlockError(cert)
-    if cert.is_clean():
-        return
-    raise ArceziaBlockError(cert)
+    if not cert.is_clean():
+        raise ArceziaBlockError(cert)
+    if getattr(cert, "allow", False) is True:
+        reason = pass_hold_reason(cert, call)
+        if reason is not None:
+            raise ArceziaBlockError(cert, f"[Arcezia HOLD] {reason} Nothing ran.")
 
 
 def warn_if_fail_open(az: Any) -> None:

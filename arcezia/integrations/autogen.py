@@ -79,7 +79,7 @@ reached through ``guard.az`` — the same Arcezia client, no private access:
                           outcome={"rows_affected": 50000},
                           expected={"rows_affected": 1})
 
-    # Level 3 — ground human intent (a model cannot forge this)
+    # Level 3 — attach a person's approval (a model cannot produce this)
     guard.az.authorize(token=user_approval_token)
 
 Levels explained in full: ``help(arcezia)`` or https://arcezia.com/docs
@@ -91,10 +91,15 @@ import warnings
 
 import asyncio
 import functools
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Optional
 
-from arcezia.client import Arcezia, ArceziaUnavailableError
-from arcezia.integrations._common import coerce_az, describe, refuse_unless_clean
+from arcezia.client import (
+    Arcezia,
+    ArceziaBlockError,
+    ArceziaReviewError,
+    ArceziaUnavailableError,
+)
+from arcezia.integrations._common import call_of, coerce_az, describe, refuse_unless_clean
 from arcezia.integrations._params import scalar_params
 
 
@@ -153,12 +158,47 @@ def _infer_domain(name: str) -> str:
 
 
 def _describe_call(name: str, args: tuple, kwargs: dict) -> str:
-    """One shared description for every adapter — see ``_common.describe``.
-
-    Was 80 chars per argument and 300 overall, while the wrapper went on to
-    execute the full arguments (A5-5).
-    """
+    """One shared description for every adapter — see ``_common.describe``."""
     return describe(name, args, kwargs)
+
+
+def _raise_unless_cleared(name: str, cert, call: Optional[dict] = None) -> None:
+    """Raise unless the certificate lets the call run.
+
+    BLOCK raises ``ArceziaBlockError`` and REVIEW raises ``ArceziaReviewError``.
+    Both carry the certificate as ``err.cert`` (why it was held, and what
+    would release it) and both subclass ``RuntimeError``, so code written
+    against earlier releases that catches ``RuntimeError`` keeps working.
+    """
+    if cert.block:
+        msg = (
+            f"[Arcezia BLOCK] {cert.summary}"
+        )
+        if cert.fabrication_detected:
+            msg += f" | FABRICATION: {cert.fabricated_constraints}"
+        elif not cert.fabrication_reported:
+            # Not reported is not the same as clean; say so.
+            msg += " | fabrication: not reported by this server"
+        if cert.reason:
+            msg += f" | Reason: {', '.join(cert.reason)}"
+        raise ArceziaBlockError(cert, msg)
+    if cert.review:
+        raise ArceziaReviewError(
+            cert,
+            f"[Arcezia REVIEW] Human confirmation required before "
+            f"'{name}' can execute. {cert.summary} | "
+            f"To proceed: {', '.join(cert.release)}",
+        )
+    if cert.degraded:
+        raise ArceziaUnavailableError(
+            RuntimeError(
+                f"Degraded certificate (unverified): {cert.summary}. "
+                "The action was not verified."
+            )
+        )
+    # An ALLOW whose fabrication result was never reported is not a clearance,
+    # and an ALLOW runs only on a pass naming `call` (see _common).
+    refuse_unless_clean(cert, call)
 
 
 class ArceziaAutoGenGuard:
@@ -187,7 +227,8 @@ class ArceziaAutoGenGuard:
     ) -> Callable:
         """
         Return a sync wrapper that calls Arcezia before executing fn.
-        Raises RuntimeError on BLOCK or REVIEW.
+        Raises ArceziaBlockError on BLOCK and ArceziaReviewError on REVIEW
+        (both subclass RuntimeError and carry the certificate as ``err.cert``).
         """
         effective_domain = domain or _infer_domain(name)
 
@@ -197,40 +238,12 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
-                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                # Typed keyword arguments, forwarded to your registered checks.
                 action_parameters=scalar_params(kwargs),
             )
-            if cert.block:
-                msg = (
-                    f"[Arcezia BLOCK] {cert.summary} | "
-                    f"trust={cert.trust_score:.0%}"
-                )
-                if cert.fabrication_detected:
-                    msg += f" | FABRICATION: {cert.fabricated_constraints}"
-                elif not cert.fabrication_reported:
-                    # None, not False: this server never said. Absence of an
-                    # accusation is not a clearance, and a message that omits
-                    # the line reads as one.
-                    msg += " | fabrication: not reported by this server"
-                if cert.violated:
-                    msg += f" | Violated: {', '.join(cert.violated)}"
-                raise RuntimeError(msg)
-            if cert.review:
-                raise RuntimeError(
-                    f"[Arcezia REVIEW] Human confirmation required before "
-                    f"'{name}' can execute. {cert.summary} | "
-                    f"Missing evidence: {', '.join(cert.missing)}"
-                )
-            if cert.degraded:
-                raise ArceziaUnavailableError(
-                    RuntimeError(
-                        f"Degraded certificate (unverified): {cert.summary}. "
-                        "The action was not verified by the engine."
-                    )
-                )
-            # An ALLOW whose fabrication channel never reported is not a
-            # clearance (T7). One helper, every adapter — see _common.
-            refuse_unless_clean(cert)
+            _raise_unless_cleared(name, cert, call_of(
+                name, effective_domain, _describe_call(name, args, kwargs),
+                scalar_params(kwargs)))
             return fn(*args, **kwargs)
 
         return _guarded
@@ -253,7 +266,8 @@ class ArceziaAutoGenGuard:
         """
         Return an async wrapper for AutoGen 0.4 FunctionTool.
         The Arcezia HTTP call runs in a thread pool via asyncio.to_thread().
-        Raises RuntimeError on BLOCK or REVIEW.
+        Raises ArceziaBlockError on BLOCK and ArceziaReviewError on REVIEW
+        (both subclass RuntimeError and carry the certificate as ``err.cert``).
         """
         effective_domain = domain or _infer_domain(name)
 
@@ -264,40 +278,12 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
-                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                # Typed keyword arguments, forwarded to your registered checks.
                 action_parameters=scalar_params(kwargs),
             )
-            if cert.block:
-                msg = (
-                    f"[Arcezia BLOCK] {cert.summary} | "
-                    f"trust={cert.trust_score:.0%}"
-                )
-                if cert.fabrication_detected:
-                    msg += f" | FABRICATION: {cert.fabricated_constraints}"
-                elif not cert.fabrication_reported:
-                    # None, not False: this server never said. Absence of an
-                    # accusation is not a clearance, and a message that omits
-                    # the line reads as one.
-                    msg += " | fabrication: not reported by this server"
-                if cert.violated:
-                    msg += f" | Violated: {', '.join(cert.violated)}"
-                raise RuntimeError(msg)
-            if cert.review:
-                raise RuntimeError(
-                    f"[Arcezia REVIEW] Human confirmation required before "
-                    f"'{name}' can execute. {cert.summary} | "
-                    f"Missing evidence: {', '.join(cert.missing)}"
-                )
-            if cert.degraded:
-                raise ArceziaUnavailableError(
-                    RuntimeError(
-                        f"Degraded certificate (unverified): {cert.summary}. "
-                        "The action was not verified by the engine."
-                    )
-                )
-            # An ALLOW whose fabrication channel never reported is not a
-            # clearance (T7). One helper, every adapter — see _common.
-            refuse_unless_clean(cert)
+            _raise_unless_cleared(name, cert, call_of(
+                name, effective_domain, _describe_call(name, args, kwargs),
+                scalar_params(kwargs)))
             return await fn(*args, **kwargs)
 
         return _guarded_async
@@ -321,37 +307,12 @@ class ArceziaAutoGenGuard:
                 action_type=name,
                 action_description=_describe_call(name, args, kwargs),
                 domain=effective_domain,
-                # Typed keyword arguments -> probe lookup keys (bounds-safe).
+                # Typed keyword arguments, forwarded to your registered checks.
                 action_parameters=scalar_params(kwargs),
             )
-            if cert.block:
-                msg = (
-                    f"[Arcezia BLOCK] {cert.summary} | "
-                    f"trust={cert.trust_score:.0%}"
-                )
-                if cert.fabrication_detected:
-                    msg += f" | FABRICATION: {cert.fabricated_constraints}"
-                elif not cert.fabrication_reported:
-                    # None, not False: this server never said. Absence of an
-                    # accusation is not a clearance, and a message that omits
-                    # the line reads as one.
-                    msg += " | fabrication: not reported by this server"
-                raise RuntimeError(msg)
-            if cert.review:
-                raise RuntimeError(
-                    f"[Arcezia REVIEW] Human confirmation required: "
-                    f"{cert.summary} | Missing: {', '.join(cert.missing)}"
-                )
-            if cert.degraded:
-                raise ArceziaUnavailableError(
-                    RuntimeError(
-                        f"Degraded certificate (unverified): {cert.summary}. "
-                        "The action was not verified by the engine."
-                    )
-                )
-            # An ALLOW whose fabrication channel never reported is not a
-            # clearance (T7). One helper, every adapter — see _common.
-            refuse_unless_clean(cert)
+            _raise_unless_cleared(name, cert, call_of(
+                name, effective_domain, _describe_call(name, args, kwargs),
+                scalar_params(kwargs)))
             return await asyncio.to_thread(fn, *args, **kwargs)
 
         return _guarded_as_async
